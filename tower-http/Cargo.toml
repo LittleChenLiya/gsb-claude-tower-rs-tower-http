@@ -145,3 +145,7 @@ allowed_external_types = [
     "tracing::*",
     "tracing_core::*",
 ]
+
+[[example]]
+name = "request-id-strict"
+required-features = ["request-id", "util"]

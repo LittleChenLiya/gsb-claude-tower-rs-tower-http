@@ -333,6 +333,60 @@ pub trait ServiceBuilderExt<L>: sealed::Sealed<L> + Sized {
         self.propagate_request_id(crate::request_id::X_REQUEST_ID)
     }
 
+    /// Add a strict request id layer.
+    ///
+    /// See [`tower_http::request_id`] for more details.
+    ///
+    /// [`tower_http::request_id`]: crate::request_id
+    #[cfg(feature = "request-id")]
+    fn set_request_id_strict<M>(
+        self,
+        header_name: HeaderName,
+        make_request_id: M,
+    ) -> ServiceBuilder<Stack<crate::request_id::StrictSetRequestIdLayer<M>, L>>
+    where
+        M: crate::request_id::MakeRequestId;
+
+    /// Add a strict request id layer, using `x-request-id` as the header name.
+    ///
+    /// See [`tower_http::request_id`] for more details.
+    ///
+    /// [`tower_http::request_id`]: crate::request_id
+    #[cfg(feature = "request-id")]
+    fn set_x_request_id_strict<M>(
+        self,
+        make_request_id: M,
+    ) -> ServiceBuilder<Stack<crate::request_id::StrictSetRequestIdLayer<M>, L>>
+    where
+        M: crate::request_id::MakeRequestId,
+    {
+        self.set_request_id_strict(crate::request_id::X_REQUEST_ID, make_request_id)
+    }
+
+    /// Propgate request ids from requests to responses in strict mode.
+    ///
+    /// See [`tower_http::request_id`] for more details.
+    ///
+    /// [`tower_http::request_id`]: crate::request_id
+    #[cfg(feature = "request-id")]
+    fn propagate_request_id_strict(
+        self,
+        header_name: HeaderName,
+    ) -> ServiceBuilder<Stack<crate::request_id::StrictPropagateRequestIdLayer, L>>;
+
+    /// Propgate request ids from requests to responses in strict mode, using
+    /// `x-request-id` as the header name.
+    ///
+    /// See [`tower_http::request_id`] for more details.
+    ///
+    /// [`tower_http::request_id`]: crate::request_id
+    #[cfg(feature = "request-id")]
+    fn propagate_x_request_id_strict(
+        self,
+    ) -> ServiceBuilder<Stack<crate::request_id::StrictPropagateRequestIdLayer, L>> {
+        self.propagate_request_id_strict(crate::request_id::X_REQUEST_ID)
+    }
+
     /// Catch panics and convert them into `500 Internal Server` responses.
     ///
     /// See [`tower_http::catch_panic`] for more details.
@@ -581,6 +635,29 @@ impl<L> ServiceBuilderExt<L> for ServiceBuilder<L> {
         header_name: HeaderName,
     ) -> ServiceBuilder<Stack<crate::request_id::PropagateRequestIdLayer, L>> {
         self.layer(crate::request_id::PropagateRequestIdLayer::new(header_name))
+    }
+
+    #[cfg(feature = "request-id")]
+    fn set_request_id_strict<M>(
+        self,
+        header_name: HeaderName,
+        make_request_id: M,
+    ) -> ServiceBuilder<Stack<crate::request_id::StrictSetRequestIdLayer<M>, L>>
+    where
+        M: crate::request_id::MakeRequestId,
+    {
+        self.layer(crate::request_id::StrictSetRequestIdLayer::new(
+            header_name,
+            make_request_id,
+        ))
+    }
+
+    #[cfg(feature = "request-id")]
+    fn propagate_request_id_strict(
+        self,
+        header_name: HeaderName,
+    ) -> ServiceBuilder<Stack<crate::request_id::StrictPropagateRequestIdLayer, L>> {
+        self.layer(crate::request_id::StrictPropagateRequestIdLayer::new(header_name))
     }
 
     #[cfg(feature = "catch-panic")]

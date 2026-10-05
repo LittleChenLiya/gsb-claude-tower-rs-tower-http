@@ -166,6 +166,58 @@
 //! requests or responses. Among other things, this allows other middleware to conditionally set
 //! request ids and use the middleware in this module as a fallback.
 //!
+//! # Strict mode
+//!
+//! The default layers are permissive: they accept any header value and never reject a request.
+//! For services that require a stable, trustworthy request identity, strict mode is opt-in via
+//! [`SetRequestIdLayer::strict`] and [`PropagateRequestIdLayer::strict`] (or the
+//! `set_request_id_strict` / `propagate_request_id_strict` methods on [`ServiceBuilderExt`]).
+//!
+//! In strict mode:
+//!
+//! - duplicate or malformed incoming ids are rejected before the inner service is called;
+//! - the generator is only invoked when no id is present, and its output is validated;
+//! - a legal id is sealed into the request extension and the sealed identity is authoritative;
+//! - the response is propagated using the sealed identity, without re-reading headers that the
+//!   service may have modified;
+//! - a response that carries a different id is rejected or overwritten according to the
+//!   [`ResponseIdPolicy`].
+//!
+//! Error messages never contain the offending header value. The default (non-strict) behavior is
+//! unchanged.
+//!
+//! ```
+//! use http::{Request, Response, header::HeaderName};
+//! use tower::{Service, ServiceExt, ServiceBuilder};
+//! use tower_http::request_id::{
+//!     SetRequestIdLayer, PropagateRequestIdLayer, MakeRequestId, RequestId,
+//! };
+//! use http_body_util::Full;
+//! use bytes::Bytes;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # let handler = tower::service_fn(|request: Request<Full<Bytes>>| async move {
+//! #     Ok::<_, std::convert::Infallible>(Response::new(request.into_body()))
+//! # });
+//! # let make_request_id = tower_http::request_id::MakeRequestUuid;
+//! let mut svc = ServiceBuilder::new()
+//!     .layer(SetRequestIdLayer::x_request_id(make_request_id).strict())
+//!     .layer(PropagateRequestIdLayer::x_request_id().strict())
+//!     .service(handler);
+//!
+//! // A legal incoming id is echoed back as-is.
+//! let request = Request::builder()
+//!     .header("x-request-id", "req-abc-123")
+//!     .body(Full::default())
+//!     .unwrap();
+//! let response = svc.ready().await?.call(request).await?;
+//! assert_eq!(response.headers()["x-request-id"], "req-abc-123");
+//! #
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! [`ServiceBuilderExt`]: crate::ServiceBuilderExt
 //! [`Uuid`]: https://crates.io/crates/uuid
 //! [`Trace`]: crate::trace::Trace
@@ -176,12 +228,104 @@ use http::{
 };
 use pin_project_lite::pin_project;
 use std::task::{ready, Context, Poll};
+use std::{error::Error as StdError, fmt};
 use std::{future::Future, pin::Pin};
 use tower_layer::Layer;
 use tower_service::Service;
 use uuid::Uuid;
 
 pub(crate) const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+
+/// Returns `true` if `value` is a legal request id in strict mode.
+///
+/// A legal request id is non-empty and contains only visible ASCII characters
+/// (`0x21..=0x7e`). This rejects empty values as well as values containing
+/// spaces, tabs, control characters or non-ASCII bytes.
+fn is_valid_request_id(value: &HeaderValue) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty() && bytes.iter().all(|&b| (0x21..=0x7e).contains(&b))
+}
+
+/// A violation detected by strict request-id middleware.
+///
+/// Strict mode rejects malformed or inconsistent request ids instead of silently
+/// falling back. The error messages never contain the offending header value, so
+/// untrusted input is not reflected back to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RequestIdError {
+    /// The request carried more than one request-id header.
+    DuplicateRequestId,
+    /// The incoming request-id header had an illegal format.
+    InvalidRequestId,
+    /// No request-id was present and the generator returned `None`.
+    MissingRequestId,
+    /// The generator produced an illegal request-id.
+    InvalidGeneratedRequestId,
+    /// The response carried a request-id different from the sealed identity.
+    ResponseIdMismatch,
+}
+
+impl fmt::Display for RequestIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateRequestId => write!(f, "duplicate request-id header"),
+            Self::InvalidRequestId => write!(f, "invalid request-id header"),
+            Self::MissingRequestId => write!(f, "missing request-id"),
+            Self::InvalidGeneratedRequestId => write!(f, "generated request-id is invalid"),
+            Self::ResponseIdMismatch => {
+                write!(f, "response request-id does not match the sealed identity")
+            }
+        }
+    }
+}
+
+impl StdError for RequestIdError {}
+
+/// What to do when a response carries a request id different from the sealed
+/// identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ResponseIdPolicy {
+    /// Reject the response with an error.
+    ///
+    /// This is the default.
+    #[default]
+    Reject,
+    /// Overwrite the response header (and extension) with the sealed identity.
+    Overwrite,
+}
+
+/// The error type for strict request-id middleware.
+///
+/// Errors from the inner service are wrapped in [`Inner`](Self::Inner), while
+/// request-id violations are wrapped in [`RequestId`](Self::RequestId).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RequestIdServiceError<E> {
+    /// The inner service returned an error.
+    Inner(E),
+    /// A request-id violation was detected.
+    RequestId(RequestIdError),
+}
+
+impl<E: fmt::Display> fmt::Display for RequestIdServiceError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inner(e) => write!(f, "{e}"),
+            Self::RequestId(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<E: StdError + 'static> StdError for RequestIdServiceError<E> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Inner(e) => Some(e),
+            Self::RequestId(e) => Some(e),
+        }
+    }
+}
 
 /// Trait for producing [`RequestId`]s.
 ///
@@ -247,6 +391,25 @@ impl<M> SetRequestIdLayer<M> {
         M: MakeRequestId,
     {
         SetRequestIdLayer::new(X_REQUEST_ID, make_request_id)
+    }
+
+    /// Switch to strict mode.
+    ///
+    /// In strict mode:
+    ///
+    /// - duplicate or malformed incoming request ids are rejected before the
+    ///   inner service is called;
+    /// - the generator is only invoked when no id is present, and its output is
+    ///   validated;
+    /// - a legal id is sealed into the request extension and the sealed identity
+    ///   is authoritative.
+    ///
+    /// The default (non-strict) behavior is unchanged.
+    pub fn strict(self) -> StrictSetRequestIdLayer<M> {
+        StrictSetRequestIdLayer {
+            header_name: self.header_name,
+            make_request_id: self.make_request_id,
+        }
     }
 }
 
@@ -363,6 +526,18 @@ impl PropagateRequestIdLayer {
     pub const fn x_request_id() -> Self {
         Self::new(X_REQUEST_ID)
     }
+
+    /// Switch to strict mode.
+    ///
+    /// In strict mode the sealed request identity is propagated to the response
+    /// without re-reading headers that the service may have modified. See
+    /// [`StrictPropagateRequestIdLayer`] for details.
+    pub fn strict(self) -> StrictPropagateRequestIdLayer {
+        StrictPropagateRequestIdLayer {
+            header_name: self.header_name,
+            policy: ResponseIdPolicy::Reject,
+        }
+    }
 }
 
 impl<S> Layer<S> for PropagateRequestIdLayer {
@@ -461,6 +636,439 @@ where
                 .headers_mut()
                 .insert(this.header_name.clone(), request_id.0.clone());
             response.extensions_mut().insert(request_id);
+        }
+
+        Poll::Ready(Ok(response))
+    }
+}
+
+/// A [`Layer`] that applies [`StrictSetRequestId`].
+///
+/// See the [module docs](self) and [`StrictSetRequestId`] for more details.
+#[derive(Debug, Clone)]
+pub struct StrictSetRequestIdLayer<M> {
+    header_name: HeaderName,
+    make_request_id: M,
+}
+
+impl<M> StrictSetRequestIdLayer<M> {
+    /// Create a new `StrictSetRequestIdLayer`.
+    pub const fn new(header_name: HeaderName, make_request_id: M) -> Self
+    where
+        M: MakeRequestId,
+    {
+        Self {
+            header_name,
+            make_request_id,
+        }
+    }
+
+    /// Create a new `StrictSetRequestIdLayer` that uses `x-request-id` as the header name.
+    pub const fn x_request_id(make_request_id: M) -> Self
+    where
+        M: MakeRequestId,
+    {
+        Self::new(X_REQUEST_ID, make_request_id)
+    }
+}
+
+impl<S, M> Layer<S> for StrictSetRequestIdLayer<M>
+where
+    M: Clone + MakeRequestId,
+{
+    type Service = StrictSetRequestId<S, M>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StrictSetRequestId::new(
+            inner,
+            self.header_name.clone(),
+            self.make_request_id.clone(),
+        )
+    }
+}
+
+/// Set request id headers and extensions on requests, rejecting malformed ids.
+///
+/// This is the strict counterpart of [`SetRequestId`].
+///
+/// # Behavior
+///
+/// - If the request already carries a sealed [`RequestId`] extension (e.g. an
+///   outer layer already sealed one), it is reused and the generator is never
+///   invoked again. The header is restored to the sealed identity.
+/// - If the request carries the header more than once, the request is rejected
+///   with [`RequestIdError::DuplicateRequestId`] and the inner service is never
+///   called.
+/// - If the request carries a single illegal header value, it is rejected with
+///   [`RequestIdError::InvalidRequestId`] and the inner service is never called.
+/// - If the header is absent, [`MakeRequestId::make_request_id`] is called
+///   exactly once. A `None` result is rejected with
+///   [`RequestIdError::MissingRequestId`], and an illegal generated value is
+///   rejected with [`RequestIdError::InvalidGeneratedRequestId`].
+/// - A legal id is inserted into [`Request::extensions`] and the request header.
+///
+/// Error messages never contain the offending header value.
+#[derive(Debug, Clone)]
+pub struct StrictSetRequestId<S, M> {
+    inner: S,
+    header_name: HeaderName,
+    make_request_id: M,
+}
+
+impl<S, M> StrictSetRequestId<S, M> {
+    /// Create a new `StrictSetRequestId`.
+    pub const fn new(inner: S, header_name: HeaderName, make_request_id: M) -> Self
+    where
+        M: MakeRequestId,
+    {
+        Self {
+            inner,
+            header_name,
+            make_request_id,
+        }
+    }
+
+    /// Create a new `StrictSetRequestId` that uses `x-request-id` as the header name.
+    pub const fn x_request_id(inner: S, make_request_id: M) -> Self
+    where
+        M: MakeRequestId,
+    {
+        Self::new(inner, X_REQUEST_ID, make_request_id)
+    }
+
+    define_inner_service_accessors!();
+
+    /// Returns a new [`Layer`] that wraps services with a `StrictSetRequestId` middleware.
+    pub const fn layer(header_name: HeaderName, make_request_id: M) -> StrictSetRequestIdLayer<M>
+    where
+        M: MakeRequestId,
+    {
+        StrictSetRequestIdLayer::new(header_name, make_request_id)
+    }
+}
+
+impl<S, M, ReqBody, ResBody> Service<Request<ReqBody>> for StrictSetRequestId<S, M>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+    M: MakeRequestId,
+{
+    type Response = S::Response;
+    type Error = RequestIdServiceError<S::Error>;
+    type Future = StrictSetRequestIdResponseFuture<S::Future>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner
+            .poll_ready(cx)
+            .map_err(RequestIdServiceError::Inner)
+    }
+
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+        // If an outer layer already sealed an identity, reuse it. This guarantees
+        // nested layers never re-generate an id.
+        if let Some(sealed) = req.extensions().get::<RequestId>().cloned() {
+            req.headers_mut()
+                .insert(self.header_name.clone(), sealed.into_header_value());
+            return StrictSetRequestIdResponseFuture {
+                inner: Some(self.inner.call(req)),
+                rejection: None,
+            };
+        }
+
+        let mut values = req.headers().get_all(&self.header_name).iter();
+        let first = values.next();
+        let second = values.next();
+
+        match (first, second) {
+            (None, _) => {
+                // No incoming id: the generator is called exactly once.
+                match self.make_request_id.make_request_id(&req) {
+                    None => StrictSetRequestIdResponseFuture {
+                        inner: None,
+                        rejection: Some(RequestIdError::MissingRequestId),
+                    },
+                    Some(id) if !is_valid_request_id(id.header_value()) => {
+                        StrictSetRequestIdResponseFuture {
+                            inner: None,
+                            rejection: Some(RequestIdError::InvalidGeneratedRequestId),
+                        }
+                    }
+                    Some(id) => {
+                        req.extensions_mut().insert(id.clone());
+                        req.headers_mut()
+                            .insert(self.header_name.clone(), id.into_header_value());
+                        StrictSetRequestIdResponseFuture {
+                            inner: Some(self.inner.call(req)),
+                            rejection: None,
+                        }
+                    }
+                }
+            }
+            (Some(_), Some(_)) => StrictSetRequestIdResponseFuture {
+                inner: None,
+                rejection: Some(RequestIdError::DuplicateRequestId),
+            },
+            (Some(value), None) => {
+                if !is_valid_request_id(value) {
+                    StrictSetRequestIdResponseFuture {
+                        inner: None,
+                        rejection: Some(RequestIdError::InvalidRequestId),
+                    }
+                } else {
+                    let id = RequestId::new(value.clone());
+                    req.extensions_mut().insert(id);
+                    StrictSetRequestIdResponseFuture {
+                        inner: Some(self.inner.call(req)),
+                        rejection: None,
+                    }
+                }
+            }
+        }
+    }
+}
+
+pin_project! {
+    /// Response future for [`StrictSetRequestId`].
+    pub struct StrictSetRequestIdResponseFuture<F> {
+        #[pin]
+        inner: Option<F>,
+        rejection: Option<RequestIdError>,
+    }
+}
+
+impl<F, B, E> Future for StrictSetRequestIdResponseFuture<F>
+where
+    F: Future<Output = Result<Response<B>, E>>,
+{
+    type Output = Result<Response<B>, RequestIdServiceError<E>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if let Some(rejection) = this.rejection.take() {
+            return Poll::Ready(Err(RequestIdServiceError::RequestId(rejection)));
+        }
+        match this.inner.as_pin_mut() {
+            Some(future) => future
+                .poll(cx)
+                .map(|result| result.map_err(RequestIdServiceError::Inner)),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// A [`Layer`] that applies [`StrictPropagateRequestId`].
+///
+/// See the [module docs](self) and [`StrictPropagateRequestId`] for more details.
+#[derive(Debug, Clone)]
+pub struct StrictPropagateRequestIdLayer {
+    header_name: HeaderName,
+    policy: ResponseIdPolicy,
+}
+
+impl StrictPropagateRequestIdLayer {
+    /// Create a new `StrictPropagateRequestIdLayer` with the default
+    /// [`ResponseIdPolicy::Reject`] policy.
+    pub const fn new(header_name: HeaderName) -> Self {
+        Self {
+            header_name,
+            policy: ResponseIdPolicy::Reject,
+        }
+    }
+
+    /// Create a new `StrictPropagateRequestIdLayer` that uses `x-request-id` as the header name.
+    pub const fn x_request_id() -> Self {
+        Self::new(X_REQUEST_ID)
+    }
+
+    /// Set the policy used when the response carries a different request id.
+    pub fn with_policy(mut self, policy: ResponseIdPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Reject responses that carry a different request id.
+    pub fn reject_on_mismatch(self) -> Self {
+        self.with_policy(ResponseIdPolicy::Reject)
+    }
+
+    /// Overwrite responses that carry a different request id with the sealed identity.
+    pub fn overwrite_on_mismatch(self) -> Self {
+        self.with_policy(ResponseIdPolicy::Overwrite)
+    }
+}
+
+impl<S> Layer<S> for StrictPropagateRequestIdLayer {
+    type Service = StrictPropagateRequestId<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StrictPropagateRequestId::new(inner, self.header_name.clone(), self.policy)
+    }
+}
+
+/// Propagate the sealed request identity to responses, rejecting mismatches.
+///
+/// This is the strict counterpart of [`PropagateRequestId`].
+///
+/// The sealed identity is captured from the request extension (or the incoming
+/// header) **before** the inner service is called. The request header is never
+/// re-read after the service runs, so a service that modifies the request header
+/// cannot change the propagated identity.
+///
+/// Behavior on the response:
+///
+/// - no response header: the sealed identity is inserted;
+/// - a single response header equal to the sealed identity: it is kept and the
+///   extension is sealed;
+/// - a single response header different from the sealed identity, or multiple
+///   response headers: the response is rejected with
+///   [`RequestIdError::ResponseIdMismatch`] under [`ResponseIdPolicy::Reject`],
+///   or overwritten with the sealed identity under
+///   [`ResponseIdPolicy::Overwrite`].
+#[derive(Debug, Clone)]
+pub struct StrictPropagateRequestId<S> {
+    inner: S,
+    header_name: HeaderName,
+    policy: ResponseIdPolicy,
+}
+
+impl<S> StrictPropagateRequestId<S> {
+    /// Create a new `StrictPropagateRequestId` with the default
+    /// [`ResponseIdPolicy::Reject`] policy.
+    pub const fn new(inner: S, header_name: HeaderName, policy: ResponseIdPolicy) -> Self {
+        Self {
+            inner,
+            header_name,
+            policy,
+        }
+    }
+
+    /// Create a new `StrictPropagateRequestId` that uses `x-request-id` as the header name.
+    pub const fn x_request_id(inner: S) -> Self {
+        Self::new(inner, X_REQUEST_ID, ResponseIdPolicy::Reject)
+    }
+
+    /// Set the policy used when the response carries a different request id.
+    pub fn with_policy(mut self, policy: ResponseIdPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Reject responses that carry a different request id.
+    pub fn reject_on_mismatch(self) -> Self {
+        self.with_policy(ResponseIdPolicy::Reject)
+    }
+
+    /// Overwrite responses that carry a different request id with the sealed identity.
+    pub fn overwrite_on_mismatch(self) -> Self {
+        self.with_policy(ResponseIdPolicy::Overwrite)
+    }
+
+    define_inner_service_accessors!();
+
+    /// Returns a new [`Layer`] that wraps services with a `StrictPropagateRequestId` middleware.
+    pub const fn layer(header_name: HeaderName) -> StrictPropagateRequestIdLayer {
+        StrictPropagateRequestIdLayer::new(header_name)
+    }
+}
+
+impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for StrictPropagateRequestId<S>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+{
+    type Response = S::Response;
+    type Error = RequestIdServiceError<S::Error>;
+    type Future = StrictPropagateRequestIdResponseFuture<S::Future>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner
+            .poll_ready(cx)
+            .map_err(RequestIdServiceError::Inner)
+    }
+
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+        // Capture the sealed identity BEFORE calling the inner service. Prefer
+        // the sealed extension, falling back to the incoming header. The header
+        // is never re-read after the service runs.
+        let sealed = req
+            .extensions()
+            .get::<RequestId>()
+            .cloned()
+            .or_else(|| {
+                req.headers()
+                    .get(&self.header_name)
+                    .cloned()
+                    .map(RequestId::new)
+            });
+
+        if let Some(id) = &sealed {
+            if req.extensions().get::<RequestId>().is_none() {
+                req.extensions_mut().insert(id.clone());
+            }
+        }
+
+        StrictPropagateRequestIdResponseFuture {
+            inner: self.inner.call(req),
+            header_name: self.header_name.clone(),
+            sealed,
+            policy: self.policy,
+        }
+    }
+}
+
+pin_project! {
+    /// Response future for [`StrictPropagateRequestId`].
+    pub struct StrictPropagateRequestIdResponseFuture<F> {
+        #[pin]
+        inner: F,
+        header_name: HeaderName,
+        sealed: Option<RequestId>,
+        policy: ResponseIdPolicy,
+    }
+}
+
+impl<F, B, E> Future for StrictPropagateRequestIdResponseFuture<F>
+where
+    F: Future<Output = Result<Response<B>, E>>,
+{
+    type Output = Result<Response<B>, RequestIdServiceError<E>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let mut response = ready!(this.inner.poll(cx)).map_err(RequestIdServiceError::Inner)?;
+
+        if let Some(sealed) = this.sealed {
+            let mut values = response.headers().get_all(&*this.header_name).iter();
+            let first = values.next();
+            let second = values.next();
+
+            match (first, second) {
+                (None, _) => {
+                    response
+                        .headers_mut()
+                        .insert(this.header_name.clone(), sealed.header_value().clone());
+                    response.extensions_mut().insert(sealed.clone());
+                }
+                (Some(value), None) if value == sealed.header_value() => {
+                    if response.extensions().get::<RequestId>().is_none() {
+                        response.extensions_mut().insert(sealed.clone());
+                    }
+                }
+                _ => match this.policy {
+                    ResponseIdPolicy::Reject => {
+                        return Poll::Ready(Err(RequestIdServiceError::RequestId(
+                            RequestIdError::ResponseIdMismatch,
+                        )));
+                    }
+                    ResponseIdPolicy::Overwrite => {
+                        response.headers_mut().insert(
+                            this.header_name.clone(),
+                            sealed.header_value().clone(),
+                        );
+                        response.extensions_mut().insert(sealed.clone());
+                    }
+                },
+            }
         }
 
         Poll::Ready(Ok(response))
@@ -598,5 +1206,277 @@ mod tests {
         let mut res = svc.clone().oneshot(req).await.unwrap();
         let id = res.headers_mut().remove("x-request-id").unwrap();
         id.to_str().unwrap().parse::<Uuid>().unwrap();
+    }
+
+    // ---- strict mode tests ----
+
+    #[derive(Clone)]
+    struct CountingGenerator {
+        calls: Arc<AtomicUsize>,
+        value: HeaderValue,
+    }
+
+    impl CountingGenerator {
+        fn legal(calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                calls,
+                value: HeaderValue::from_static("generated-1"),
+            }
+        }
+
+        fn illegal(calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                calls,
+                value: HeaderValue::from_static(""),
+            }
+        }
+    }
+
+    impl MakeRequestId for CountingGenerator {
+        fn make_request_id<B>(&mut self, _request: &Request<B>) -> Option<RequestId> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some(RequestId::new(self.value.clone()))
+        }
+    }
+
+    fn counting_handler(
+        calls: Arc<AtomicUsize>,
+    ) -> impl FnMut(Request<Body>) -> futures_util::future::BoxFuture<'static, Result<Response<Body>, Infallible>>
+           + Clone {
+        move |_req: Request<Body>| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_duplicate_incoming_rejected() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let generator_calls = Arc::new(AtomicUsize::new(0));
+
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::legal(generator_calls.clone()))
+            .propagate_x_request_id_strict()
+            .service_fn(counting_handler(handler_calls.clone()));
+
+        let req = Request::builder()
+            .header("x-request-id", "a")
+            .header("x-request-id", "b")
+            .body(Body::empty())
+            .unwrap();
+
+        let err = svc.oneshot(req).await.unwrap_err();
+        assert!(matches!(
+            err,
+            RequestIdServiceError::RequestId(RequestIdError::DuplicateRequestId)
+        ));
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(generator_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn strict_illegal_incoming_rejected() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let generator_calls = Arc::new(AtomicUsize::new(0));
+
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::legal(generator_calls.clone()))
+            .propagate_x_request_id_strict()
+            .service_fn(counting_handler(handler_calls.clone()));
+
+        let req = Request::builder()
+            .header("x-request-id", "not legal")
+            .body(Body::empty())
+            .unwrap();
+
+        let err = svc.oneshot(req).await.unwrap_err();
+        assert!(matches!(
+            err,
+            RequestIdServiceError::RequestId(RequestIdError::InvalidRequestId)
+        ));
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(generator_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn strict_legal_incoming_echoed() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let generator_calls = Arc::new(AtomicUsize::new(0));
+
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::legal(generator_calls.clone()))
+            .propagate_x_request_id_strict()
+            .service_fn(counting_handler(handler_calls.clone()));
+
+        let req = Request::builder()
+            .header("x-request-id", "req-abc-123")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.headers()["x-request-id"], "req-abc-123");
+        assert_eq!(
+            res.extensions().get::<RequestId>().unwrap().header_value(),
+            "req-abc-123"
+        );
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(generator_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn strict_missing_id_generated() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let generator_calls = Arc::new(AtomicUsize::new(0));
+
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::legal(generator_calls.clone()))
+            .propagate_x_request_id_strict()
+            .service_fn(counting_handler(handler_calls.clone()));
+
+        let req = Request::builder().body(Body::empty()).unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.headers()["x-request-id"], "generated-1");
+        assert_eq!(
+            res.extensions().get::<RequestId>().unwrap().header_value(),
+            "generated-1"
+        );
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(generator_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_generated_illegal_rejected() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let generator_calls = Arc::new(AtomicUsize::new(0));
+
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::illegal(generator_calls.clone()))
+            .propagate_x_request_id_strict()
+            .service_fn(counting_handler(handler_calls.clone()));
+
+        let req = Request::builder().body(Body::empty()).unwrap();
+
+        let err = svc.oneshot(req).await.unwrap_err();
+        assert!(matches!(
+            err,
+            RequestIdServiceError::RequestId(RequestIdError::InvalidGeneratedRequestId)
+        ));
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(generator_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_service_modifies_request_header_uses_sealed_identity() {
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::legal(Arc::new(AtomicUsize::new(0))))
+            .propagate_x_request_id_strict()
+            .service_fn(|mut req: Request<Body>| async move {
+                // The service tampers with the request header after it was sealed.
+                req.headers_mut()
+                    .insert("x-request-id", "tampered".parse().unwrap());
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            });
+
+        let req = Request::builder()
+            .header("x-request-id", "sealed-id")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        // The response must carry the sealed identity, not the tampered header.
+        assert_eq!(res.headers()["x-request-id"], "sealed-id");
+        assert_eq!(
+            res.extensions().get::<RequestId>().unwrap().header_value(),
+            "sealed-id"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_nested_layers_do_not_regenerate() {
+        let generator_calls = Arc::new(AtomicUsize::new(0));
+
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::legal(generator_calls.clone()))
+            .set_x_request_id_strict(CountingGenerator::legal(generator_calls.clone()))
+            .propagate_x_request_id_strict()
+            .service_fn(handler);
+
+        let req = Request::builder().body(Body::empty()).unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.headers()["x-request-id"], "generated-1");
+        assert_eq!(generator_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_response_mismatch_rejected() {
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::legal(Arc::new(AtomicUsize::new(0))))
+            .propagate_x_request_id_strict()
+            .service_fn(|_req: Request<Body>| async move {
+                let mut res = Response::new(Body::empty());
+                res.headers_mut()
+                    .insert("x-request-id", "different".parse().unwrap());
+                Ok::<_, Infallible>(res)
+            });
+
+        let req = Request::builder()
+            .header("x-request-id", "sealed-id")
+            .body(Body::empty())
+            .unwrap();
+
+        let err = svc.oneshot(req).await.unwrap_err();
+        assert!(matches!(
+            err,
+            RequestIdServiceError::Inner(RequestIdServiceError::RequestId(
+                RequestIdError::ResponseIdMismatch
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_response_mismatch_overwritten() {
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::legal(Arc::new(AtomicUsize::new(0))))
+            .layer(StrictPropagateRequestIdLayer::x_request_id().overwrite_on_mismatch())
+            .service_fn(|_req: Request<Body>| async move {
+                let mut res = Response::new(Body::empty());
+                res.headers_mut()
+                    .insert("x-request-id", "different".parse().unwrap());
+                Ok::<_, Infallible>(res)
+            });
+
+        let req = Request::builder()
+            .header("x-request-id", "sealed-id")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.headers()["x-request-id"], "sealed-id");
+        assert_eq!(
+            res.extensions().get::<RequestId>().unwrap().header_value(),
+            "sealed-id"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_error_does_not_contain_illegal_value() {
+        let svc = ServiceBuilder::new()
+            .set_x_request_id_strict(CountingGenerator::legal(Arc::new(AtomicUsize::new(0))))
+            .propagate_x_request_id_strict()
+            .service_fn(handler);
+
+        let req = Request::builder()
+            .header("x-request-id", "has spaces")
+            .body(Body::empty())
+            .unwrap();
+
+        let err = svc.oneshot(req).await.unwrap_err();
+        let message = err.to_string();
+        assert!(!message.contains("has spaces"));
     }
 }
