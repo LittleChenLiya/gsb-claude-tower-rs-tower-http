@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# Unreleased
+
+## Added
+
+- **request-id:** add an explicit strict mode via `StrictSetRequestIdLayer` and
+  `StrictPropagateRequestIdLayer`. Strict mode rejects duplicated or invalid incoming request ids
+  (`400 Bad Request`) before calling the inner service or generator, seals the validated id in the
+  request extensions and always propagates that sealed id (never a request header mutated by an
+  inner service). The generator only runs when no id is present and its output is validated as
+  well; a response carrying a different id can be overwritten or rejected (`500 Internal Server
+  Error`) according to `ResponseRequestIdPolicy`. `ValidateRequestId`/`AsciiRequestId` configure
+  what counts as a legal id. The default layers keep their permissive behavior.
+
 # 0.7.1
 
 [Changes since 0.7.0](https://github.com/tower-rs/tower-http/compare/tower-http-0.7.0...tower-http-0.7.1)
