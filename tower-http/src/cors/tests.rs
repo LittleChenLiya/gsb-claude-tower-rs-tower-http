@@ -244,3 +244,500 @@ async fn exact_origin_does_not_emit_origin_vary_header() {
 
     assert!(res.headers().get(header::VARY).is_none());
 }
+
+mod decision {
+    use std::convert::Infallible;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use crate::test_helpers::Body;
+    use http::{header, HeaderValue, Method, Request, Response, StatusCode};
+    use tower::{service_fn, util::ServiceExt, Layer, Service};
+
+    use crate::cors::{
+        AllowCredentials, AllowOrigin, Any, CorsLayer, Decision, DecisionLayer, DenyReason,
+        InvalidCorsPolicy,
+    };
+
+    const ALLOWED_ORIGIN: HeaderValue = HeaderValue::from_static("https://allowed.example");
+
+    fn sealed_layer() -> DecisionLayer {
+        DecisionLayer::from_layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list([ALLOWED_ORIGIN]))
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([header::CONTENT_TYPE])
+                .allow_credentials(true),
+        )
+        .unwrap()
+    }
+
+    fn counting_service(
+        hits: &Arc<AtomicUsize>,
+    ) -> impl Service<
+        Request<Body>,
+        Response = Response<Body>,
+        Error = Infallible,
+        Future = impl std::future::Future<Output = Result<Response<Body>, Infallible>>,
+    > + Clone {
+        let hits = Arc::clone(hits);
+        service_fn(move |_: Request<Body>| {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, Infallible>(Response::new(Body::empty())) }
+        })
+    }
+
+    #[tokio::test]
+    async fn seal_rejects_credentials_with_wildcard_origin() {
+        let err = CorsLayer::new()
+            .allow_credentials(true)
+            .allow_origin(Any)
+            .seal()
+            .unwrap_err();
+        assert_eq!(err, InvalidCorsPolicy::CredentialsWithWildcardOrigin);
+    }
+
+    #[tokio::test]
+    async fn seal_rejects_credentials_with_other_wildcards() {
+        let err = CorsLayer::new()
+            .allow_credentials(true)
+            .allow_methods(Any)
+            .seal()
+            .unwrap_err();
+        assert_eq!(err, InvalidCorsPolicy::CredentialsWithWildcardAllowMethods);
+
+        let err = CorsLayer::new()
+            .allow_credentials(true)
+            .allow_headers(Any)
+            .seal()
+            .unwrap_err();
+        assert_eq!(err, InvalidCorsPolicy::CredentialsWithWildcardAllowHeaders);
+
+        let err = CorsLayer::new()
+            .allow_credentials(true)
+            .expose_headers(Any)
+            .seal()
+            .unwrap_err();
+        assert_eq!(err, InvalidCorsPolicy::CredentialsWithWildcardExposeHeaders);
+    }
+
+    #[tokio::test]
+    async fn preflight_and_actual_request_share_sealed_policy() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut svc = sealed_layer().layer(counting_service(&hits));
+
+        // Preflight for `GET` is allowed by the sealed policy.
+        let preflight = Request::builder()
+            .method(Method::OPTIONS)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(preflight).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&ALLOWED_ORIGIN)
+        );
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_METHODS),
+            Some(&HeaderValue::from_static("GET,POST"))
+        );
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS),
+            Some(&HeaderValue::from_static("content-type"))
+        );
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+            Some(&HeaderValue::from_static("true"))
+        );
+        // preflights never execute the inner service
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // The actual request is evaluated against the same sealed policy.
+        let actual = Request::builder()
+            .method(Method::GET)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(actual).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&ALLOWED_ORIGIN)
+        );
+        assert_eq!(
+            res.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+            Some(&HeaderValue::from_static("true"))
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn denied_request_does_not_execute_inner_service_and_does_not_echo_origin() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut svc = sealed_layer().layer(counting_service(&hits));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        // the unknown origin is not echoed back
+        assert!(res
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+        // the business service was not executed
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        // the policy's Vary values are still emitted for cache correctness
+        assert_eq!(
+            res.headers().get(header::VARY),
+            Some(&HeaderValue::from_static("origin"))
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_preflight_does_not_execute_inner_service() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut svc = sealed_layer().layer(counting_service(&hits));
+
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "DELETE")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .is_none());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn methods_are_case_sensitive_per_http_spec() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut svc = sealed_layer().layer(counting_service(&hits));
+
+        // `get` is not `GET`: HTTP methods are case-sensitive tokens.
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "get")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn headers_are_case_insensitive_per_http_spec() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut svc = sealed_layer().layer(counting_service(&hits));
+
+        // Field names are case-insensitive: `CONTENT-TYPE` matches the
+        // configured `content-type`.
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "CONTENT-TYPE")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "x-not-allowed")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn vary_merging_preserves_existing_values() {
+        async fn inner_svc(_: Request<Body>) -> Result<Response<Body>, Infallible> {
+            Ok(Response::builder()
+                .header(header::VARY, "accept, accept-encoding")
+                .body(Body::empty())
+                .unwrap())
+        }
+
+        let mut svc = sealed_layer().layer(service_fn(inner_svc));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        let vary = res
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        // the inner service's values are kept and the policy's are appended
+        assert_eq!(
+            vary,
+            vec![
+                HeaderValue::from_static("accept, accept-encoding"),
+                HeaderValue::from_static("origin"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_origin_policy_is_evaluated_once_per_request() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let predicate_calls = Arc::clone(&calls);
+        let layer = DecisionLayer::from_layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(move |origin, _| {
+                    predicate_calls.fetch_add(1, Ordering::SeqCst);
+                    origin == ALLOWED_ORIGIN
+                }))
+                .allow_methods([Method::GET]),
+        )
+        .unwrap();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut svc = layer.layer(counting_service(&hits));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn dynamic_async_origin_policy_is_evaluated_once_per_request() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let predicate_calls = Arc::clone(&calls);
+        let layer = DecisionLayer::from_layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::async_predicate(move |origin, _| {
+                    predicate_calls.fetch_add(1, Ordering::SeqCst);
+                    async move { origin == ALLOWED_ORIGIN }
+                }))
+                .allow_methods([Method::GET]),
+        )
+        .unwrap();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut svc = layer.layer(counting_service(&hits));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .header(header::ORIGIN, ALLOWED_ORIGIN)
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Table-driven policy checks: each row seals a configuration, evaluates
+    /// one request through `CorsPolicy::decide`, and compares the explicit
+    /// decision snapshot against the expected outcome.
+    #[tokio::test]
+    async fn policy_table() {
+        #[derive(Debug, PartialEq)]
+        enum Expected {
+            Allow { preflight: bool },
+            Deny(DenyReason),
+        }
+
+        struct Case {
+            name: &'static str,
+            layer: CorsLayer,
+            method: Method,
+            origin: Option<&'static str>,
+            request_method: Option<&'static str>,
+            request_headers: Option<&'static str>,
+            expected: Expected,
+        }
+
+        fn base() -> CorsLayer {
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list([ALLOWED_ORIGIN]))
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([header::CONTENT_TYPE])
+        }
+
+        let cases = vec![
+            Case {
+                name: "known origin, actual request",
+                layer: base(),
+                method: Method::GET,
+                origin: Some("https://allowed.example"),
+                request_method: None,
+                request_headers: None,
+                expected: Expected::Allow { preflight: false },
+            },
+            Case {
+                name: "unknown origin is rejected, not echoed",
+                layer: base(),
+                method: Method::GET,
+                origin: Some("https://evil.example"),
+                request_method: None,
+                request_headers: None,
+                expected: Expected::Deny(DenyReason::OriginNotAllowed),
+            },
+            Case {
+                name: "no origin header passes through",
+                layer: base(),
+                method: Method::GET,
+                origin: None,
+                request_method: None,
+                request_headers: None,
+                expected: Expected::Allow { preflight: false },
+            },
+            Case {
+                name: "preflight with allowed method",
+                layer: base(),
+                method: Method::OPTIONS,
+                origin: Some("https://allowed.example"),
+                request_method: Some("POST"),
+                request_headers: None,
+                expected: Expected::Allow { preflight: true },
+            },
+            Case {
+                name: "preflight with disallowed method",
+                layer: base(),
+                method: Method::OPTIONS,
+                origin: Some("https://allowed.example"),
+                request_method: Some("DELETE"),
+                request_headers: None,
+                expected: Expected::Deny(DenyReason::MethodNotAllowed),
+            },
+            Case {
+                name: "preflight method is case-sensitive",
+                layer: base(),
+                method: Method::OPTIONS,
+                origin: Some("https://allowed.example"),
+                request_method: Some("get"),
+                request_headers: None,
+                expected: Expected::Deny(DenyReason::MethodNotAllowed),
+            },
+            Case {
+                name: "preflight header names are case-insensitive",
+                layer: base(),
+                method: Method::OPTIONS,
+                origin: Some("https://allowed.example"),
+                request_method: Some("GET"),
+                request_headers: Some("Content-Type"),
+                expected: Expected::Allow { preflight: true },
+            },
+            Case {
+                name: "preflight with unknown header",
+                layer: base(),
+                method: Method::OPTIONS,
+                origin: Some("https://allowed.example"),
+                request_method: Some("GET"),
+                request_headers: Some("x-evil"),
+                expected: Expected::Deny(DenyReason::RequestHeadersNotAllowed),
+            },
+            Case {
+                name: "predicate credentials with wildcard origin denied at request time",
+                layer: CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_credentials(AllowCredentials::predicate(|_, _| true)),
+                method: Method::GET,
+                origin: Some("https://allowed.example"),
+                request_method: None,
+                request_headers: None,
+                expected: Expected::Deny(DenyReason::CredentialsWithWildcardOrigin),
+            },
+            Case {
+                name: "plain OPTIONS without request-method is an actual request",
+                layer: base(),
+                method: Method::OPTIONS,
+                origin: Some("https://allowed.example"),
+                request_method: None,
+                request_headers: None,
+                expected: Expected::Allow { preflight: false },
+            },
+        ];
+
+        for case in cases {
+            let name = case.name;
+            let policy = case
+                .layer
+                .seal()
+                .unwrap_or_else(|err| panic!("case `{}` failed to seal: {}", name, err));
+
+            let mut builder = Request::builder().method(case.method);
+            if let Some(origin) = case.origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            if let Some(request_method) = case.request_method {
+                builder = builder.header(header::ACCESS_CONTROL_REQUEST_METHOD, request_method);
+            }
+            if let Some(request_headers) = case.request_headers {
+                builder = builder.header(header::ACCESS_CONTROL_REQUEST_HEADERS, request_headers);
+            }
+            let (parts, _) = builder.body(()).unwrap().into_parts();
+
+            let decision = policy.decide(&parts).await;
+            let actual = match &decision {
+                Decision::Allow(allow) => Expected::Allow {
+                    preflight: allow.is_preflight(),
+                },
+                Decision::Deny(deny) => {
+                    // denied decisions never echo the request origin
+                    assert!(
+                        deny.headers()
+                            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                            .is_none(),
+                        "case `{}` echoes the origin on deny",
+                        name
+                    );
+                    Expected::Deny(deny.reason())
+                }
+            };
+            assert_eq!(actual, case.expected, "case `{}`", name);
+        }
+    }
+}

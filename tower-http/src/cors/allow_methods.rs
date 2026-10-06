@@ -76,6 +76,26 @@ impl AllowMethods {
         !matches!(&self.0, AllowMethodsInner::Const(_))
     }
 
+    /// Check whether a requested method is allowed by this configuration.
+    ///
+    /// HTTP methods are case-sensitive tokens ([RFC 9110, section 9.1]), so
+    /// the comparison against the configured list is done byte-by-byte,
+    /// without any case normalization.
+    ///
+    /// [RFC 9110, section 9.1]: https://www.rfc-editor.org/rfc/rfc9110#section-9.1
+    #[allow(clippy::borrow_interior_mutable_const)]
+    pub(super) fn allows(&self, method: &Method) -> bool {
+        match &self.0 {
+            AllowMethodsInner::Const(None) => false,
+            AllowMethodsInner::Const(Some(v)) if *v == WILDCARD => true,
+            AllowMethodsInner::Const(Some(v)) => v
+                .as_bytes()
+                .split(|b| *b == b',')
+                .any(|token| super::decision::trim(token) == method.as_str().as_bytes()),
+            AllowMethodsInner::MirrorRequest => true,
+        }
+    }
+
     pub(super) fn to_header(&self, parts: &RequestParts) -> Option<(HeaderName, HeaderValue)> {
         let allow_methods = match &self.0 {
             AllowMethodsInner::Const(v) => v.clone()?,

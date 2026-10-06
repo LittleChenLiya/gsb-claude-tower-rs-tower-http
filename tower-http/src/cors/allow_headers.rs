@@ -62,6 +62,27 @@ impl AllowHeaders {
         !matches!(&self.0, AllowHeadersInner::Const(_))
     }
 
+    /// Check whether a requested header is allowed by this configuration.
+    ///
+    /// HTTP field names are case-insensitive ([RFC 9110, section 5.1]), so
+    /// configured and requested names are compared as [`HeaderName`]s, which
+    /// normalize to lowercase.
+    ///
+    /// [RFC 9110, section 5.1]: https://www.rfc-editor.org/rfc/rfc9110#section-5.1
+    #[allow(clippy::borrow_interior_mutable_const)]
+    pub(super) fn allows(&self, header: &HeaderName) -> bool {
+        match &self.0 {
+            AllowHeadersInner::Const(None) => false,
+            AllowHeadersInner::Const(Some(v)) if *v == WILDCARD => true,
+            AllowHeadersInner::Const(Some(v)) => v
+                .as_bytes()
+                .split(|b| *b == b',')
+                .filter_map(|token| HeaderName::from_bytes(super::decision::trim(token)).ok())
+                .any(|name| name == *header),
+            AllowHeadersInner::MirrorRequest => true,
+        }
+    }
+
     pub(super) fn to_header(&self, parts: &RequestParts) -> Option<(HeaderName, HeaderValue)> {
         let allow_headers = match &self.0 {
             AllowHeadersInner::Const(v) => v.clone()?,

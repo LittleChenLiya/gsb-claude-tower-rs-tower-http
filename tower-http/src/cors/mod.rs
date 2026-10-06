@@ -67,6 +67,7 @@ mod allow_headers;
 mod allow_methods;
 mod allow_origin;
 mod allow_private_network;
+pub mod decision;
 mod expose_headers;
 mod max_age;
 mod vary;
@@ -75,9 +76,18 @@ mod vary;
 mod tests;
 
 pub use self::{
-    allow_credentials::AllowCredentials, allow_headers::AllowHeaders, allow_methods::AllowMethods,
-    allow_origin::AllowOrigin, allow_private_network::AllowPrivateNetwork,
-    expose_headers::ExposeHeaders, max_age::MaxAge, vary::Vary,
+    allow_credentials::AllowCredentials,
+    allow_headers::AllowHeaders,
+    allow_methods::AllowMethods,
+    allow_origin::AllowOrigin,
+    allow_private_network::AllowPrivateNetwork,
+    decision::{
+        AllowDecision, CorsPolicy, Decision, DecisionFuture, DecisionLayer, DecisionService,
+        DenyDecision, DenyReason, InvalidCorsPolicy,
+    },
+    expose_headers::ExposeHeaders,
+    max_age::MaxAge,
+    vary::Vary,
 };
 
 /// Layer that applies the [`Cors`] middleware which adds headers for [CORS][mdn].
