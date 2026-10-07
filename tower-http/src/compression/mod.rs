@@ -705,4 +705,145 @@ mod tests {
             Some("gzip")
         );
     }
+
+    const DIAGNOSTICS_HEADER: &str = "x-compression-negotiation";
+
+    #[tokio::test]
+    async fn diagnostics_report_quality_zero_and_not_listed() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc)
+            .compress_when(Always)
+            .negotiation_diagnostics(true);
+
+        let req = Request::builder()
+            .header("accept-encoding", "gzip;q=0")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        // identity is selected: 200 without content-encoding
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(res.headers().get(CONTENT_ENCODING).is_none());
+        assert_eq!(
+            res.headers()[DIAGNOSTICS_HEADER],
+            "gzip=quality-zero, deflate=not-listed, br=not-listed, zstd=not-listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_report_wildcard_zero_on_406() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc)
+            .compress_when(Always)
+            .negotiation_diagnostics(true);
+
+        let req = Request::builder()
+            .header("accept-encoding", "*;q=0")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        assert_eq!(res.status(), http::StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            res.headers()[DIAGNOSTICS_HEADER],
+            "identity=wildcard-zero, gzip=wildcard-zero, deflate=wildcard-zero, \
+             br=wildcard-zero, zstd=wildcard-zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_report_wildcard_zero_with_explicit_gzip() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc)
+            .compress_when(Always)
+            .negotiation_diagnostics(true);
+
+        let req = Request::builder()
+            .header("accept-encoding", "*;q=0,gzip")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(res.headers()[CONTENT_ENCODING], "gzip");
+        assert_eq!(
+            res.headers()[DIAGNOSTICS_HEADER],
+            "identity=wildcard-zero, deflate=wildcard-zero, br=wildcard-zero, \
+             zstd=wildcard-zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_treat_duplicate_listings_as_acceptable() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc)
+            .compress_when(Always)
+            .negotiation_diagnostics(true);
+
+        // the q=0.5 duplicate overrides the q=0 listing, so gzip is selected
+        let req = Request::builder()
+            .header("accept-encoding", "gzip;q=0,gzip;q=0.5")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(res.headers()[CONTENT_ENCODING], "gzip");
+        assert_eq!(
+            res.headers()[DIAGNOSTICS_HEADER],
+            "deflate=not-listed, br=not-listed, zstd=not-listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_disabled_by_default_leaves_response_untouched() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc).compress_when(Always);
+
+        let req = Request::builder()
+            .header("accept-encoding", "gzip;q=0")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        // the original response is passed through without any diagnostics header
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(res.headers().get(CONTENT_ENCODING).is_none());
+        assert!(res.headers().get(DIAGNOSTICS_HEADER).is_none());
+
+        let collected = res.into_body().collect().await.unwrap();
+        assert_eq!(collected.to_bytes(), "Hello, World!");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_omitted_when_nothing_forbidden() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc)
+            .compress_when(Always)
+            .negotiation_diagnostics(true);
+
+        let req = Request::builder()
+            .header("accept-encoding", "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(res.headers()[CONTENT_ENCODING], "gzip");
+        // deflate/br/zstd are not listed, so they are still reported
+        assert_eq!(
+            res.headers()[DIAGNOSTICS_HEADER],
+            "deflate=not-listed, br=not-listed, zstd=not-listed"
+        );
+
+        // a wildcard accepting everything leaves nothing forbidden
+        let req = Request::builder()
+            .header("accept-encoding", "*")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(res.headers().get(DIAGNOSTICS_HEADER).is_none());
+    }
 }

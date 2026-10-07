@@ -19,6 +19,7 @@ pub struct Compression<S, P = DefaultPredicate> {
     pub(crate) accept: AcceptEncoding,
     pub(crate) predicate: P,
     pub(crate) quality: CompressionLevel,
+    pub(crate) diagnostics: bool,
 }
 
 impl<S> Compression<S, DefaultPredicate> {
@@ -29,6 +30,7 @@ impl<S> Compression<S, DefaultPredicate> {
             accept: AcceptEncoding::default(),
             predicate: DefaultPredicate::default(),
             quality: CompressionLevel::default(),
+            diagnostics: false,
         }
     }
 }
@@ -74,6 +76,22 @@ impl<S, P> Compression<S, P> {
     /// Sets the compression quality.
     pub fn quality(mut self, quality: CompressionLevel) -> Self {
         self.quality = quality;
+        self
+    }
+
+    /// Sets whether to attach content-negotiation diagnostics to responses.
+    ///
+    /// When enabled, responses carry an `x-compression-negotiation` header listing each
+    /// server-supported encoding the request's `Accept-Encoding` explicitly forbade, along
+    /// with the reason: `quality-zero` (listed with `q=0`), `not-listed` (absent without a
+    /// wildcard), or `wildcard-zero` (forbidden by `*;q=0`). The header is omitted when
+    /// nothing was forbidden.
+    ///
+    /// The diagnostics are computed from the same parse of `Accept-Encoding` as the
+    /// encoding selection itself. This is a debugging aid; it is disabled by default and
+    /// does not change how the response encoding is selected.
+    pub fn negotiation_diagnostics(mut self, enable: bool) -> Self {
+        self.diagnostics = enable;
         self
     }
 
@@ -153,6 +171,7 @@ impl<S, P> Compression<S, P> {
             accept: self.accept,
             predicate,
             quality: self.quality,
+            diagnostics: self.diagnostics,
         }
     }
 }
@@ -173,11 +192,18 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let encoding = Encoding::from_headers(req.headers(), self.accept);
+        // Parse `Accept-Encoding` once; the selected encoding and the diagnostics view
+        // both come from this single negotiation.
+        let negotiation = Encoding::negotiate(req.headers(), self.accept);
 
         ResponseFuture {
             inner: self.inner.call(req),
-            encoding,
+            encoding: negotiation.selected,
+            diagnostics: if self.diagnostics {
+                Some(negotiation)
+            } else {
+                None
+            },
             predicate: self.predicate.clone(),
             quality: self.quality,
         }

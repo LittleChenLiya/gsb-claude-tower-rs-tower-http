@@ -97,13 +97,17 @@ impl Encoding {
     ))]
     // based on https://github.com/http-rs/accept-encoding
     //
-    // Returns `Some(encoding)` for the best acceptable encoding, or `None` if the client's
-    // preferences cannot be satisfied (406 Not Acceptable per RFC 9110 §12.5.3).
-    pub(crate) fn from_headers(
+    // Negotiates the response encoding against the request's `Accept-Encoding` headers.
+    //
+    // The returned [`Negotiation`] holds both the selected encoding (`Some(encoding)` for the
+    // best acceptable encoding, or `None` if the client's preferences cannot be satisfied,
+    // i.e. 406 Not Acceptable per RFC 9110 §12.5.3) and a diagnostics view of the encodings
+    // the client explicitly forbade. Both are computed from a single parse of the headers.
+    pub(crate) fn negotiate(
         headers: &http::HeaderMap,
         supported_encoding: impl SupportedEncodings,
-    ) -> Option<Self> {
-        preferred_encoding_with_wildcard(headers, supported_encoding)
+    ) -> Negotiation {
+        negotiate_encoding(headers, supported_encoding)
     }
 
     #[cfg(any(
@@ -271,33 +275,141 @@ fn wildcard_qvalue(headers: &http::HeaderMap) -> Option<QValue> {
         })
 }
 
-/// Selects the preferred encoding considering the `*` wildcard per RFC 9110 §12.5.3.
-///
-/// The wildcard applies its q-value to any encoding not explicitly listed. If all acceptable
-/// encodings (including identity) are excluded, returns `None` to signal 406 Not Acceptable.
+/// The reason a server-supported encoding was not acceptable to the client, as declared by
+/// the request's `Accept-Encoding` header.
 #[cfg(any(
     feature = "compression-gzip",
     feature = "compression-br",
     feature = "compression-zstd",
     feature = "compression-deflate",
 ))]
-fn preferred_encoding_with_wildcard(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectionReason {
+    /// The encoding was explicitly listed with `q=0` (and no `q>0` listing overrode it).
+    QualityZero,
+    /// The encoding was not listed and no `*` wildcard was present.
+    NotListed,
+    /// The encoding was not listed and the `*` wildcard forbade it with `q=0`.
+    WildcardZero,
+}
+
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+impl RejectionReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RejectionReason::QualityZero => "quality-zero",
+            RejectionReason::NotListed => "not-listed",
+            RejectionReason::WildcardZero => "wildcard-zero",
+        }
+    }
+}
+
+/// A server-supported encoding the client explicitly forbade via `Accept-Encoding`.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EncodingRejection {
+    pub(crate) encoding: Encoding,
+    pub(crate) reason: RejectionReason,
+}
+
+/// The result of negotiating a response encoding against the request's `Accept-Encoding`
+/// headers.
+///
+/// The selected encoding and the diagnostics view of explicitly forbidden encodings are
+/// computed from a single parse of the headers; entries with malformed q-values are ignored
+/// during parsing, exactly as before.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+#[derive(Debug, Clone)]
+pub(crate) struct Negotiation {
+    /// The selected encoding, or `None` if the client's preferences cannot be satisfied
+    /// (406 Not Acceptable per RFC 9110 §12.5.3).
+    pub(crate) selected: Option<Encoding>,
+    rejections: Vec<EncodingRejection>,
+}
+
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+impl Negotiation {
+    /// The server-supported encodings the client explicitly forbade, in a fixed
+    /// (identity, gzip, deflate, br, zstd) order.
+    pub(crate) fn rejections(&self) -> &[EncodingRejection] {
+        &self.rejections
+    }
+
+    /// Renders the rejections as a diagnostics header value, e.g.
+    /// `gzip=quality-zero, br=not-listed`. Returns `None` when nothing was forbidden.
+    pub(crate) fn rejections_header_value(&self) -> Option<http::HeaderValue> {
+        let rejections = self.rejections();
+        if rejections.is_empty() {
+            return None;
+        }
+
+        let mut value = String::new();
+        for (i, rejection) in rejections.iter().enumerate() {
+            if i > 0 {
+                value.push_str(", ");
+            }
+            value.push_str(rejection.encoding.to_str());
+            value.push('=');
+            value.push_str(rejection.reason.as_str());
+        }
+
+        // Both the encoding names and the reason tokens are static ASCII strings,
+        // so this can never produce an invalid header value.
+        http::HeaderValue::from_str(&value).ok()
+    }
+}
+
+/// Selects the preferred encoding considering the `*` wildcard per RFC 9110 §12.5.3 and
+/// builds the diagnostics view of explicitly forbidden encodings from the same parse.
+///
+/// The wildcard applies its q-value to any encoding not explicitly listed. If all acceptable
+/// encodings (including identity) are excluded, `selected` is `None` to signal
+/// 406 Not Acceptable.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+fn negotiate_encoding(
     headers: &http::HeaderMap,
     supported_encoding: impl SupportedEncodings,
-) -> Option<Encoding> {
+) -> Negotiation {
+    // The headers are parsed exactly once; both the selection and the diagnostics view
+    // below are computed from these parsed values.
     let explicit: Vec<(Encoding, QValue)> = encodings(headers, supported_encoding).collect();
     let wildcard_q = wildcard_qvalue(headers);
+    let supported = all_supported_encodings(supported_encoding);
 
-    // If there is no wildcard, use only the explicitly listed encodings.
-    // Per RFC 9110 §12.5.3, if identity is excluded (q=0) and no other encoding is
-    // acceptable, the server SHOULD respond with 406.
-    let wildcard_q = match wildcard_q {
-        Some(q) => q,
+    let selected = match wildcard_q {
+        // If there is no wildcard, use only the explicitly listed encodings.
+        // Per RFC 9110 §12.5.3, if identity is excluded (q=0) and no other encoding is
+        // acceptable, the server SHOULD respond with 406.
         None => {
             let identity_rejected = explicit
                 .iter()
                 .any(|(enc, q)| *enc == Encoding::Identity && q.0 == 0);
-            return match Encoding::preferred_encoding(explicit.into_iter()) {
+            match Encoding::preferred_encoding(explicit.iter().copied()) {
                 Some(enc) => Some(enc),
                 None => {
                     if identity_rejected {
@@ -306,25 +418,91 @@ fn preferred_encoding_with_wildcard(
                         Some(Encoding::Identity)
                     }
                 }
-            };
+            }
+        }
+        // The wildcard applies its q-value to any encoding not explicitly listed. For each
+        // supported encoding, use its explicit q-value if listed, otherwise the wildcard
+        // q-value.
+        Some(wildcard_q) => {
+            let effective = supported.iter().filter_map(|e| *e).map(|enc| {
+                let q = explicit
+                    .iter()
+                    .find(|(e, _)| *e == enc)
+                    .map(|(_, q)| *q)
+                    .unwrap_or(wildcard_q);
+                (enc, q)
+            });
+            Encoding::preferred_encoding(effective)
         }
     };
 
-    // Build the effective set of (encoding, qvalue) for all supported encodings.
-    // For each supported encoding, use its explicit q-value if listed, otherwise the wildcard
-    // q-value.
-    let all_supported = all_supported_encodings(supported_encoding);
+    let rejections = forbidden_encodings(&explicit, wildcard_q, &supported, selected);
 
-    let effective = all_supported.iter().filter_map(|e| *e).map(|enc| {
-        let q = explicit
-            .iter()
-            .find(|(e, _)| *e == enc)
-            .map(|(_, q)| *q)
-            .unwrap_or(wildcard_q);
-        (enc, q)
-    });
+    Negotiation {
+        selected,
+        rejections,
+    }
+}
 
-    Encoding::preferred_encoding(effective)
+/// Builds the diagnostics view: every server-supported encoding the client explicitly
+/// forbade, tagged with how it was forbidden.
+///
+/// Only forbidden encodings are listed; encodings that were acceptable but simply not
+/// preferred are omitted. `identity` is never reported as [`RejectionReason::NotListed`]
+/// because it is implicitly acceptable unless excluded with `q=0` or a `q=0` wildcard.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+fn forbidden_encodings(
+    explicit: &[(Encoding, QValue)],
+    wildcard_q: Option<QValue>,
+    supported: &[Option<Encoding>; 5],
+    selected: Option<Encoding>,
+) -> Vec<EncodingRejection> {
+    supported
+        .iter()
+        .filter_map(|enc| *enc)
+        .filter(|enc| Some(*enc) != selected)
+        .filter_map(|enc| {
+            // With duplicate listings (e.g. `gzip;q=0,gzip;q=0.5`) the encoding is only
+            // forbidden if no listing leaves it acceptable.
+            let mut listed = false;
+            let mut acceptable = false;
+            for (e, q) in explicit {
+                if *e == enc {
+                    listed = true;
+                    acceptable |= q.0 > 0;
+                }
+            }
+
+            let reason = if listed {
+                if acceptable {
+                    return None;
+                }
+                RejectionReason::QualityZero
+            } else {
+                match wildcard_q {
+                    Some(q) if q.0 == 0 => RejectionReason::WildcardZero,
+                    // Acceptable through the wildcard, just not preferred.
+                    Some(_) => return None,
+                    None => {
+                        if enc == Encoding::Identity {
+                            return None;
+                        }
+                        RejectionReason::NotListed
+                    }
+                }
+            };
+
+            Some(EncodingRejection {
+                encoding: enc,
+                reason,
+            })
+        })
+        .collect()
 }
 
 /// Returns all encodings the server supports (including Identity) in a fixed-capacity array.
@@ -381,6 +559,28 @@ fn all_supported_encodings(supported_encoding: impl SupportedEncodings) -> [Opti
 mod tests {
     use super::*;
 
+    // Selection-only view over `Encoding::negotiate`, keeping the pre-existing test bodies
+    // unchanged.
+    fn selected(
+        headers: &http::HeaderMap,
+        supported_encoding: impl SupportedEncodings,
+    ) -> Option<Encoding> {
+        Encoding::negotiate(headers, supported_encoding).selected
+    }
+
+    fn headers_with_accept_encoding(value: &'static str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static(value),
+        );
+        headers
+    }
+
+    fn rejection(encoding: Encoding, reason: RejectionReason) -> EncodingRejection {
+        EncodingRejection { encoding, reason }
+    }
+
     #[derive(Copy, Clone, Default)]
     struct SupportedEncodingsAll;
 
@@ -404,7 +604,7 @@ mod tests {
 
     #[test]
     fn no_accept_encoding_header() {
-        let encoding = Encoding::from_headers(&http::HeaderMap::new(), SupportedEncodingsAll);
+        let encoding = selected(&http::HeaderMap::new(), SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
     }
 
@@ -415,7 +615,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Gzip), encoding);
     }
 
@@ -426,7 +626,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip,br"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -437,7 +637,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip,x-gzip"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Gzip), encoding);
     }
 
@@ -448,7 +648,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("deflate,x-gzip"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Gzip), encoding);
     }
 
@@ -459,7 +659,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip,deflate,br"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -470,7 +670,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.5,br"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -481,7 +681,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.5,deflate,br"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -496,7 +696,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("br"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -511,7 +711,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("br"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -530,7 +730,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("br"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -541,7 +741,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.5,br;q=0.8"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -549,7 +749,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.8,br;q=0.5"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Gzip), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -557,7 +757,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.995,br;q=0.999"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -568,7 +768,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.5,deflate;q=0.6,br;q=0.8"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -576,7 +776,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.8,deflate;q=0.6,br;q=0.5"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Gzip), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -584,7 +784,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.6,deflate;q=0.8,br;q=0.5"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Deflate), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -592,7 +792,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.995,deflate;q=0.997,br;q=0.999"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -603,7 +803,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("invalid,gzip"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Gzip), encoding);
     }
 
@@ -614,7 +814,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -622,7 +822,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0."),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -630,7 +830,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0,br;q=0.5"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -641,7 +841,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gZiP"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Gzip), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -649,7 +849,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.5,br;Q=0.8"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -660,7 +860,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static(" gzip\t; q=0.5 ,\tbr ;\tq=0.8\t"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Brotli), encoding);
     }
 
@@ -671,7 +871,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q =0.5"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -679,7 +879,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q= 0.5"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
     }
 
@@ -690,7 +890,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=-0.1"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -698,7 +898,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=00.5"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -706,7 +906,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=0.5000"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -714,7 +914,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=.5"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -722,7 +922,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=1.01"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
 
         let mut headers = http::HeaderMap::new();
@@ -730,7 +930,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("gzip;q=1.001"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Identity), encoding);
     }
 
@@ -741,7 +941,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("*"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         // * with q=1 means all encodings are acceptable; picks the highest-priority supported
         assert_eq!(Some(Encoding::Zstd), encoding);
     }
@@ -753,7 +953,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("*;q=0"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         // *;q=0 rejects everything, including identity
         assert_eq!(None, encoding);
     }
@@ -765,7 +965,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("*;q=0,gzip"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Gzip), encoding);
     }
 
@@ -776,7 +976,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("identity;q=0"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         // identity;q=0 with no other encoding explicitly listed: the server cannot
         // determine what the client accepts, so 406 per RFC 9110 §12.5.3
         assert_eq!(None, encoding);
@@ -789,7 +989,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("identity;q=0,gzip"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         assert_eq!(Some(Encoding::Gzip), encoding);
     }
 
@@ -801,7 +1001,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("*;q=0,identity;q=0"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         // Both wildcard and identity are q=0, and no explicit encoding is listed with q>0
         assert_eq!(None, encoding);
     }
@@ -813,7 +1013,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("*;q=0.5,gzip;q=1"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         // gzip is explicitly q=1, everything else gets q=0.5 from wildcard
         assert_eq!(Some(Encoding::Gzip), encoding);
     }
@@ -825,7 +1025,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("*;q=0,identity"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedEncodingsAll);
+        let encoding = selected(&headers, SupportedEncodingsAll);
         // *;q=0 rejects all, but identity is explicitly listed with q=1
         assert_eq!(Some(Encoding::Identity), encoding);
     }
@@ -855,7 +1055,7 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("*"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedGzipOnly);
+        let encoding = selected(&headers, SupportedGzipOnly);
         // Server only supports gzip, so * should pick gzip (not zstd/br)
         assert_eq!(Some(Encoding::Gzip), encoding);
     }
@@ -867,10 +1067,138 @@ mod tests {
             http::header::ACCEPT_ENCODING,
             http::HeaderValue::from_static("*;q=0,br"),
         );
-        let encoding = Encoding::from_headers(&headers, SupportedGzipOnly);
+        let encoding = selected(&headers, SupportedGzipOnly);
         // Client wants br, but server only supports gzip. br is not in the
         // supported set so it's ignored by encodings(). Wildcard rejects
         // everything else. Result: 406.
         assert_eq!(None, encoding);
+    }
+
+    #[test]
+    fn diagnostics_quality_zero_and_not_listed() {
+        let headers = headers_with_accept_encoding("gzip;q=0");
+        let negotiation = Encoding::negotiate(&headers, SupportedEncodingsAll);
+
+        // identity is the implicit fallback
+        assert_eq!(Some(Encoding::Identity), negotiation.selected);
+        // gzip is forbidden via q=0; the other supported encodings were not listed;
+        // identity is selected and therefore not reported
+        assert_eq!(
+            negotiation.rejections(),
+            &[
+                rejection(Encoding::Gzip, RejectionReason::QualityZero),
+                rejection(Encoding::Deflate, RejectionReason::NotListed),
+                rejection(Encoding::Brotli, RejectionReason::NotListed),
+                rejection(Encoding::Zstd, RejectionReason::NotListed),
+            ]
+        );
+        assert_eq!(
+            negotiation.rejections_header_value().unwrap(),
+            "gzip=quality-zero, deflate=not-listed, br=not-listed, zstd=not-listed"
+        );
+    }
+
+    #[test]
+    fn diagnostics_wildcard_zero() {
+        let headers = headers_with_accept_encoding("*;q=0");
+        let negotiation = Encoding::negotiate(&headers, SupportedEncodingsAll);
+
+        assert_eq!(None, negotiation.selected);
+        // everything, including identity, is forbidden by the wildcard
+        assert_eq!(
+            negotiation.rejections(),
+            &[
+                rejection(Encoding::Identity, RejectionReason::WildcardZero),
+                rejection(Encoding::Gzip, RejectionReason::WildcardZero),
+                rejection(Encoding::Deflate, RejectionReason::WildcardZero),
+                rejection(Encoding::Brotli, RejectionReason::WildcardZero),
+                rejection(Encoding::Zstd, RejectionReason::WildcardZero),
+            ]
+        );
+    }
+
+    #[test]
+    fn diagnostics_wildcard_zero_with_explicit_gzip() {
+        let headers = headers_with_accept_encoding("*;q=0,gzip");
+        let negotiation = Encoding::negotiate(&headers, SupportedEncodingsAll);
+
+        assert_eq!(Some(Encoding::Gzip), negotiation.selected);
+        assert_eq!(
+            negotiation.rejections(),
+            &[
+                rejection(Encoding::Identity, RejectionReason::WildcardZero),
+                rejection(Encoding::Deflate, RejectionReason::WildcardZero),
+                rejection(Encoding::Brotli, RejectionReason::WildcardZero),
+                rejection(Encoding::Zstd, RejectionReason::WildcardZero),
+            ]
+        );
+    }
+
+    #[test]
+    fn diagnostics_duplicate_listings() {
+        // A q>0 duplicate overrides the q=0 listing: gzip is acceptable, not forbidden.
+        let headers = headers_with_accept_encoding("gzip;q=0,gzip;q=0.5");
+        let negotiation = Encoding::negotiate(&headers, SupportedEncodingsAll);
+
+        assert_eq!(Some(Encoding::Gzip), negotiation.selected);
+        assert_eq!(
+            negotiation.rejections(),
+            &[
+                rejection(Encoding::Deflate, RejectionReason::NotListed),
+                rejection(Encoding::Brotli, RejectionReason::NotListed),
+                rejection(Encoding::Zstd, RejectionReason::NotListed),
+            ]
+        );
+
+        // Two q=0 listings stay forbidden.
+        let headers = headers_with_accept_encoding("gzip;q=0,gzip;q=0");
+        let negotiation = Encoding::negotiate(&headers, SupportedEncodingsAll);
+
+        assert_eq!(Some(Encoding::Identity), negotiation.selected);
+        assert!(negotiation
+            .rejections()
+            .contains(&rejection(Encoding::Gzip, RejectionReason::QualityZero)));
+    }
+
+    #[test]
+    fn diagnostics_malformed_qvalue_keeps_original_handling() {
+        // `q=0.5000` is malformed: the entry is ignored during parsing, exactly as before,
+        // so gzip is reported as not listed rather than forbidden via q=0.
+        let headers = headers_with_accept_encoding("gzip;q=0.5000");
+        let negotiation = Encoding::negotiate(&headers, SupportedEncodingsAll);
+
+        assert_eq!(Some(Encoding::Identity), negotiation.selected);
+        assert!(negotiation
+            .rejections()
+            .contains(&rejection(Encoding::Gzip, RejectionReason::NotListed)));
+        assert!(!negotiation
+            .rejections()
+            .contains(&rejection(Encoding::Gzip, RejectionReason::QualityZero)));
+    }
+
+    #[test]
+    fn diagnostics_omits_acceptable_but_not_preferred() {
+        let headers = headers_with_accept_encoding("gzip,br");
+        let negotiation = Encoding::negotiate(&headers, SupportedEncodingsAll);
+
+        assert_eq!(Some(Encoding::Brotli), negotiation.selected);
+        // gzip was acceptable and simply lost by preference: it is not a rejection.
+        assert_eq!(
+            negotiation.rejections(),
+            &[
+                rejection(Encoding::Deflate, RejectionReason::NotListed),
+                rejection(Encoding::Zstd, RejectionReason::NotListed),
+            ]
+        );
+    }
+
+    #[test]
+    fn diagnostics_empty_when_nothing_forbidden() {
+        let headers = headers_with_accept_encoding("*");
+        let negotiation = Encoding::negotiate(&headers, SupportedEncodingsAll);
+
+        assert_eq!(Some(Encoding::Zstd), negotiation.selected);
+        assert!(negotiation.rejections().is_empty());
+        assert!(negotiation.rejections_header_value().is_none());
     }
 }

@@ -4,8 +4,8 @@ use super::{body::BodyInner, CompressionBody};
 use crate::compression::predicate::Predicate;
 use crate::compression::CompressionLevel;
 use crate::compression_utils::WrapBody;
-use crate::content_encoding::Encoding;
-use http::{header, HeaderMap, HeaderValue, Response};
+use crate::content_encoding::{Encoding, Negotiation};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Response};
 use http_body::Body;
 use pin_project_lite::pin_project;
 use std::{
@@ -13,6 +13,13 @@ use std::{
     pin::Pin,
     task::{ready, Context, Poll},
 };
+
+/// Response header carrying the negotiation diagnostics view when enabled via
+/// [`Compression::negotiation_diagnostics`].
+///
+/// [`Compression::negotiation_diagnostics`]: super::Compression::negotiation_diagnostics
+const NEGOTIATION_DIAGNOSTICS_HEADER: HeaderName =
+    HeaderName::from_static("x-compression-negotiation");
 
 pin_project! {
     /// Response future of [`Compression`].
@@ -23,6 +30,7 @@ pin_project! {
         #[pin]
         pub(crate) inner: F,
         pub(crate) encoding: Option<Encoding>,
+        pub(crate) diagnostics: Option<Negotiation>,
         pub(crate) predicate: P,
         pub(crate) quality: CompressionLevel,
     }
@@ -58,6 +66,7 @@ where
                     res.headers_mut()
                         .append(header::VARY, header::ACCEPT_ENCODING.into());
                 }
+                attach_diagnostics(res.headers_mut(), self.diagnostics.as_ref());
                 let (parts, body) = res.into_parts();
                 return Poll::Ready(Ok(Response::from_parts(
                     parts,
@@ -73,6 +82,8 @@ where
             && self.predicate.should_compress(&res);
 
         let (mut parts, body) = res.into_parts();
+
+        attach_diagnostics(&mut parts.headers, self.diagnostics.as_ref());
 
         if should_compress
             && !parts.headers.get_all(header::VARY).iter().any(|value| {
@@ -145,6 +156,14 @@ where
 
         let res = Response::from_parts(parts, body);
         Poll::Ready(Ok(res))
+    }
+}
+
+/// Attaches the negotiation diagnostics header, if diagnostics were enabled for this
+/// request and at least one supported encoding was explicitly forbidden.
+fn attach_diagnostics(headers: &mut HeaderMap, diagnostics: Option<&Negotiation>) {
+    if let Some(value) = diagnostics.and_then(Negotiation::rejections_header_value) {
+        headers.insert(NEGOTIATION_DIAGNOSTICS_HEADER, value);
     }
 }
 
