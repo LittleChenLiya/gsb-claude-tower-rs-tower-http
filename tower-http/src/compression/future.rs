@@ -4,8 +4,8 @@ use super::{body::BodyInner, CompressionBody};
 use crate::compression::predicate::Predicate;
 use crate::compression::CompressionLevel;
 use crate::compression_utils::WrapBody;
-use crate::content_encoding::Encoding;
-use http::{header, HeaderMap, HeaderValue, Response};
+use crate::content_encoding::{Encoding, EncodingRejection};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Response};
 use http_body::Body;
 use pin_project_lite::pin_project;
 use std::{
@@ -13,6 +13,12 @@ use std::{
     pin::Pin,
     task::{ready, Context, Poll},
 };
+
+/// Response header carrying the `Accept-Encoding` rejection diagnostics, emitted when
+/// [`Compression::diagnostics`] is enabled.
+///
+/// [`Compression::diagnostics`]: super::Compression::diagnostics
+static REJECTIONS_HEADER: HeaderName = HeaderName::from_static("x-accept-encoding-rejections");
 
 pin_project! {
     /// Response future of [`Compression`].
@@ -25,6 +31,7 @@ pin_project! {
         pub(crate) encoding: Option<Encoding>,
         pub(crate) predicate: P,
         pub(crate) quality: CompressionLevel,
+        pub(crate) rejections: Vec<EncodingRejection>,
     }
 }
 
@@ -38,6 +45,8 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let res = ready!(self.as_mut().project().inner.poll(cx)?);
+
+        let rejections = rejections_header_value(&self.rejections);
 
         let encoding = match self.encoding {
             Some(enc) => enc,
@@ -58,6 +67,10 @@ where
                     res.headers_mut()
                         .append(header::VARY, header::ACCEPT_ENCODING.into());
                 }
+                if let Some(rejections) = rejections {
+                    res.headers_mut()
+                        .insert(REJECTIONS_HEADER.clone(), rejections);
+                }
                 let (parts, body) = res.into_parts();
                 return Poll::Ready(Ok(Response::from_parts(
                     parts,
@@ -73,6 +86,10 @@ where
             && self.predicate.should_compress(&res);
 
         let (mut parts, body) = res.into_parts();
+
+        if let Some(rejections) = rejections {
+            parts.headers.insert(REJECTIONS_HEADER.clone(), rejections);
+        }
 
         if should_compress
             && !parts.headers.get_all(header::VARY).iter().any(|value| {
@@ -157,4 +174,26 @@ fn contains_ignore_ascii_case(mut haystack: &[u8], needle: &[u8]) -> bool {
     }
 
     false
+}
+
+/// Renders the rejection diagnostics as an `x-accept-encoding-rejections` header value, or
+/// `None` when diagnostics are disabled or nothing was rejected.
+fn rejections_header_value(rejections: &[EncodingRejection]) -> Option<HeaderValue> {
+    if rejections.is_empty() {
+        return None;
+    }
+
+    let mut value = String::new();
+    for (i, rejection) in rejections.iter().enumerate() {
+        if i > 0 {
+            value.push_str(", ");
+        }
+        value.push_str(rejection.encoding.to_str());
+        value.push('=');
+        value.push_str(rejection.reason.as_str());
+    }
+
+    // The value is assembled from static lowercase tokens, digits, `=`, `,` and spaces, all
+    // of which are valid header value characters.
+    Some(HeaderValue::from_str(&value).expect("rejection tokens are valid header characters"))
 }

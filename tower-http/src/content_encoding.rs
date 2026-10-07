@@ -22,7 +22,7 @@ pub(crate) enum Encoding {
 
 impl Encoding {
     #[allow(dead_code)]
-    fn to_str(self) -> &'static str {
+    pub(crate) fn to_str(self) -> &'static str {
         match self {
             #[cfg(any(feature = "fs", feature = "compression-gzip"))]
             Encoding::Gzip => "gzip",
@@ -103,7 +103,32 @@ impl Encoding {
         headers: &http::HeaderMap,
         supported_encoding: impl SupportedEncodings,
     ) -> Option<Self> {
-        preferred_encoding_with_wildcard(headers, supported_encoding)
+        select_encoding(
+            &parse_accept_encoding(headers, supported_encoding),
+            supported_encoding,
+        )
+    }
+
+    #[cfg(any(
+        feature = "compression-gzip",
+        feature = "compression-br",
+        feature = "compression-zstd",
+        feature = "compression-deflate",
+    ))]
+    /// Negotiates the response encoding and, in the same pass over the headers, computes the
+    /// diagnostic view of the encodings the client forbade.
+    ///
+    /// This parses the `Accept-Encoding` headers exactly once; the selection and the rejection
+    /// diagnostics are both derived from that single parse result.
+    pub(crate) fn negotiate(
+        headers: &http::HeaderMap,
+        supported_encoding: impl SupportedEncodings,
+    ) -> Negotiation {
+        let parsed = parse_accept_encoding(headers, supported_encoding);
+        Negotiation {
+            encoding: select_encoding(&parsed, supported_encoding),
+            rejections: rejections_for(&parsed, supported_encoding),
+        }
     }
 
     #[cfg(any(
@@ -207,13 +232,7 @@ impl QValue {
     }
 }
 
-#[cfg(any(
-    feature = "compression-gzip",
-    feature = "compression-br",
-    feature = "compression-zstd",
-    feature = "compression-deflate",
-    feature = "fs",
-))]
+#[cfg(feature = "fs")]
 // based on https://github.com/http-rs/accept-encoding
 pub(crate) fn encodings<'a>(
     headers: &'a http::HeaderMap,
@@ -242,33 +261,74 @@ pub(crate) fn encodings<'a>(
         })
 }
 
-/// Extracts the q-value for the `*` wildcard from Accept-Encoding headers.
-/// Returns `None` if no wildcard is present.
+/// The result of parsing the `Accept-Encoding` headers exactly once.
+///
+/// Both the encoding selection and the rejection diagnostics are derived from this, so the
+/// headers are never parsed twice.
 #[cfg(any(
     feature = "compression-gzip",
     feature = "compression-br",
     feature = "compression-zstd",
     feature = "compression-deflate",
 ))]
-fn wildcard_qvalue(headers: &http::HeaderMap) -> Option<QValue> {
-    headers
+struct ParsedAcceptEncoding {
+    /// Explicitly listed, supported encodings with their q-values, in order of appearance.
+    explicit: Vec<(Encoding, QValue)>,
+    /// The q-value of the first valid `*` wildcard entry, if any.
+    wildcard: Option<QValue>,
+}
+
+/// Parses the `Accept-Encoding` headers in a single pass.
+///
+/// Malformed entries keep their original handling: unknown or unsupported codings are ignored
+/// and entries with an invalid q-value are dropped entirely.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+fn parse_accept_encoding(
+    headers: &http::HeaderMap,
+    supported_encoding: impl SupportedEncodings,
+) -> ParsedAcceptEncoding {
+    let mut parsed = ParsedAcceptEncoding {
+        explicit: Vec::new(),
+        wildcard: None,
+    };
+
+    for s in headers
         .get_all(http::header::ACCEPT_ENCODING)
         .iter()
         .filter_map(|hval| hval.to_str().ok())
-        .flat_map(|s| s.split(','))
-        .find_map(|v| {
+    {
+        for v in s.split(',') {
             let mut v = v.splitn(2, ';');
             let coding = v.next().unwrap().trim();
-            if coding != "*" {
-                return None;
-            }
+
             let qval = if let Some(qval) = v.next() {
-                QValue::parse(qval.trim())?
+                match QValue::parse(qval.trim()) {
+                    Some(qval) => qval,
+                    // Invalid q-value: drop the whole entry, as before.
+                    None => continue,
+                }
             } else {
                 QValue::one()
             };
-            Some(qval)
-        })
+
+            if coding == "*" {
+                // The first valid wildcard entry wins, as before.
+                if parsed.wildcard.is_none() {
+                    parsed.wildcard = Some(qval);
+                }
+            } else if let Some(encoding) = Encoding::parse(coding, supported_encoding) {
+                parsed.explicit.push((encoding, qval));
+            }
+            // Unknown or unsupported codings are ignored, as before.
+        }
+    }
+
+    parsed
 }
 
 /// Selects the preferred encoding considering the `*` wildcard per RFC 9110 §12.5.3.
@@ -281,23 +341,22 @@ fn wildcard_qvalue(headers: &http::HeaderMap) -> Option<QValue> {
     feature = "compression-zstd",
     feature = "compression-deflate",
 ))]
-fn preferred_encoding_with_wildcard(
-    headers: &http::HeaderMap,
+fn select_encoding(
+    parsed: &ParsedAcceptEncoding,
     supported_encoding: impl SupportedEncodings,
 ) -> Option<Encoding> {
-    let explicit: Vec<(Encoding, QValue)> = encodings(headers, supported_encoding).collect();
-    let wildcard_q = wildcard_qvalue(headers);
+    let explicit = &parsed.explicit;
 
     // If there is no wildcard, use only the explicitly listed encodings.
     // Per RFC 9110 §12.5.3, if identity is excluded (q=0) and no other encoding is
     // acceptable, the server SHOULD respond with 406.
-    let wildcard_q = match wildcard_q {
+    let wildcard_q = match parsed.wildcard {
         Some(q) => q,
         None => {
             let identity_rejected = explicit
                 .iter()
                 .any(|(enc, q)| *enc == Encoding::Identity && q.0 == 0);
-            return match Encoding::preferred_encoding(explicit.into_iter()) {
+            return match Encoding::preferred_encoding(explicit.iter().copied()) {
                 Some(enc) => Some(enc),
                 None => {
                     if identity_rejected {
@@ -325,6 +384,111 @@ fn preferred_encoding_with_wildcard(
     });
 
     Encoding::preferred_encoding(effective)
+}
+
+/// Why a supported encoding could not be selected for a response.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RejectionReason {
+    /// The encoding was listed explicitly with `q=0`.
+    ExplicitQZero,
+    /// The encoding was not listed and no `*` wildcard entry applies to it.
+    NotListed,
+    /// The encoding was not listed and is forbidden by a `*;q=0` wildcard.
+    WildcardQZero,
+}
+
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+impl RejectionReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RejectionReason::ExplicitQZero => "explicit-q-zero",
+            RejectionReason::NotListed => "not-listed",
+            RejectionReason::WildcardQZero => "wildcard-q-zero",
+        }
+    }
+}
+
+/// A supported encoding that the request's `Accept-Encoding` header forbids, together with
+/// the reason it cannot be selected.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EncodingRejection {
+    pub(crate) encoding: Encoding,
+    pub(crate) reason: RejectionReason,
+}
+
+/// The outcome of negotiating a response encoding against the `Accept-Encoding` headers.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+#[derive(Clone, Debug)]
+pub(crate) struct Negotiation {
+    /// The selected encoding, or `None` if the client's preferences cannot be satisfied
+    /// (406 Not Acceptable per RFC 9110 §12.5.3).
+    pub(crate) encoding: Option<Encoding>,
+    /// Diagnostic view of the supported encodings the client forbade.
+    pub(crate) rejections: Vec<EncodingRejection>,
+}
+
+/// Builds the diagnostic view of the supported encodings forbidden by the parsed
+/// `Accept-Encoding` headers.
+///
+/// An encoding listed multiple times is only reported as forbidden if every one of its
+/// entries has `q=0`; a single acceptable duplicate keeps it selectable, mirroring the
+/// selection which picks the maximum q-value.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+    feature = "compression-deflate",
+))]
+fn rejections_for(
+    parsed: &ParsedAcceptEncoding,
+    supported_encoding: impl SupportedEncodings,
+) -> Vec<EncodingRejection> {
+    all_supported_encodings(supported_encoding)
+        .iter()
+        .filter_map(|e| *e)
+        .filter_map(|encoding| {
+            let explicit_q = parsed
+                .explicit
+                .iter()
+                .filter(|(e, _)| *e == encoding)
+                .map(|(_, q)| *q)
+                .max();
+
+            let reason = match (explicit_q, parsed.wildcard) {
+                (Some(q), _) if q.0 > 0 => return None,
+                (Some(_), _) => RejectionReason::ExplicitQZero,
+                (None, Some(q)) if q.0 > 0 => return None,
+                (None, Some(_)) => RejectionReason::WildcardQZero,
+                // Without a wildcard, identity stays acceptable as the fallback encoding.
+                (None, None) if encoding == Encoding::Identity => return None,
+                (None, None) => RejectionReason::NotListed,
+            };
+
+            Some(EncodingRejection { encoding, reason })
+        })
+        .collect()
 }
 
 /// Returns all encodings the server supports (including Identity) in a fixed-capacity array.
@@ -872,5 +1036,127 @@ mod tests {
         // supported set so it's ignored by encodings(). Wildcard rejects
         // everything else. Result: 406.
         assert_eq!(None, encoding);
+    }
+
+    fn negotiate_one(value: &'static str) -> Negotiation {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static(value),
+        );
+        Encoding::negotiate(&headers, SupportedEncodingsAll)
+    }
+
+    #[test]
+    fn negotiate_gzip_q_zero_reports_explicit_q_zero() {
+        let negotiation = negotiate_one("gzip;q=0");
+        // The selection is unchanged: identity is the fallback.
+        assert_eq!(Some(Encoding::Identity), negotiation.encoding);
+        assert_eq!(
+            vec![
+                EncodingRejection {
+                    encoding: Encoding::Gzip,
+                    reason: RejectionReason::ExplicitQZero,
+                },
+                EncodingRejection {
+                    encoding: Encoding::Deflate,
+                    reason: RejectionReason::NotListed,
+                },
+                EncodingRejection {
+                    encoding: Encoding::Brotli,
+                    reason: RejectionReason::NotListed,
+                },
+                EncodingRejection {
+                    encoding: Encoding::Zstd,
+                    reason: RejectionReason::NotListed,
+                },
+            ],
+            negotiation.rejections,
+        );
+    }
+
+    #[test]
+    fn negotiate_wildcard_q_zero_reports_wildcard_q_zero() {
+        let negotiation = negotiate_one("*;q=0,gzip");
+        assert_eq!(Some(Encoding::Gzip), negotiation.encoding);
+        // Everything not explicitly listed is forbidden by the wildcard.
+        assert_eq!(
+            vec![
+                EncodingRejection {
+                    encoding: Encoding::Identity,
+                    reason: RejectionReason::WildcardQZero,
+                },
+                EncodingRejection {
+                    encoding: Encoding::Deflate,
+                    reason: RejectionReason::WildcardQZero,
+                },
+                EncodingRejection {
+                    encoding: Encoding::Brotli,
+                    reason: RejectionReason::WildcardQZero,
+                },
+                EncodingRejection {
+                    encoding: Encoding::Zstd,
+                    reason: RejectionReason::WildcardQZero,
+                },
+            ],
+            negotiation.rejections,
+        );
+    }
+
+    #[test]
+    fn negotiate_wildcard_q_zero_alone_is_not_satisfiable() {
+        let negotiation = negotiate_one("*;q=0");
+        assert_eq!(None, negotiation.encoding);
+        assert!(negotiation
+            .rejections
+            .iter()
+            .all(|rejection| rejection.reason == RejectionReason::WildcardQZero));
+        // All five supported encodings (including identity) are reported.
+        assert_eq!(5, negotiation.rejections.len());
+    }
+
+    #[test]
+    fn negotiate_duplicate_entries_with_one_acceptable_qvalue() {
+        // A `q=0` duplicate does not forbid the encoding when another entry accepts it.
+        let negotiation = negotiate_one("gzip;q=0,gzip;q=0.5");
+        assert_eq!(Some(Encoding::Gzip), negotiation.encoding);
+        assert!(negotiation
+            .rejections
+            .iter()
+            .all(|rejection| rejection.encoding != Encoding::Gzip));
+        assert!(negotiation
+            .rejections
+            .iter()
+            .all(|rejection| rejection.reason == RejectionReason::NotListed));
+    }
+
+    #[test]
+    fn negotiate_duplicate_q_zero_entries_report_explicit_q_zero() {
+        let negotiation = negotiate_one("gzip;q=0,gzip;q=0");
+        assert_eq!(Some(Encoding::Identity), negotiation.encoding);
+        assert!(negotiation.rejections.contains(&EncodingRejection {
+            encoding: Encoding::Gzip,
+            reason: RejectionReason::ExplicitQZero,
+        }));
+    }
+
+    #[test]
+    fn negotiate_malformed_qvalue_keeps_original_handling() {
+        // The malformed entry is dropped entirely, as before: gzip counts as not listed and
+        // the selection falls back to identity.
+        let negotiation = negotiate_one("gzip;q=abc");
+        assert_eq!(Some(Encoding::Identity), negotiation.encoding);
+        assert!(negotiation.rejections.contains(&EncodingRejection {
+            encoding: Encoding::Gzip,
+            reason: RejectionReason::NotListed,
+        }));
+    }
+
+    #[test]
+    fn negotiate_nothing_rejected_reports_empty() {
+        let negotiation = negotiate_one("gzip,deflate,br,zstd");
+        assert_eq!(Some(Encoding::Zstd), negotiation.encoding);
+        // Only identity is unlisted, and it stays acceptable as the fallback.
+        assert_eq!(Vec::<EncodingRejection>::new(), negotiation.rejections);
     }
 }

@@ -705,4 +705,205 @@ mod tests {
             Some("gzip")
         );
     }
+
+    #[tokio::test]
+    async fn diagnostics_report_gzip_q_zero() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc)
+            .diagnostics(true)
+            .compress_when(Always);
+
+        let req = Request::builder()
+            .header("accept-encoding", "gzip;q=0")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        // gzip is forbidden, so the response is the identity passthrough.
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(!res.headers().contains_key(CONTENT_ENCODING));
+        assert_eq!(
+            res.headers()
+                .get("x-accept-encoding-rejections")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip=explicit-q-zero, deflate=not-listed, br=not-listed, zstd=not-listed")
+        );
+
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"Hello, World!");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_report_wildcard_q_zero_on_406() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc)
+            .diagnostics(true)
+            .compress_when(Always);
+
+        let req = Request::builder()
+            .header("accept-encoding", "*;q=0")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        assert_eq!(res.status(), http::StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            res.headers()
+                .get("x-accept-encoding-rejections")
+                .and_then(|v| v.to_str().ok()),
+            Some(
+                "identity=wildcard-q-zero, gzip=wildcard-q-zero, deflate=wildcard-q-zero, \
+                 br=wildcard-q-zero, zstd=wildcard-q-zero"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_report_duplicate_q_zero_entries() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc)
+            .diagnostics(true)
+            .compress_when(Always);
+
+        let req = Request::builder()
+            .header("accept-encoding", "gzip;q=0,gzip;q=0")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(!res.headers().contains_key(CONTENT_ENCODING));
+        assert_eq!(
+            res.headers()
+                .get("x-accept-encoding-rejections")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip=explicit-q-zero, deflate=not-listed, br=not-listed, zstd=not-listed")
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_duplicate_entries_with_one_acceptable_qvalue() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc)
+            .diagnostics(true)
+            .compress_when(Always);
+
+        let req = Request::builder()
+            .header("accept-encoding", "gzip;q=0,gzip;q=0.5")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        // The acceptable duplicate wins: gzip is selected and not reported as rejected.
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        assert_eq!(
+            res.headers()
+                .get("x-accept-encoding-rejections")
+                .and_then(|v| v.to_str().ok()),
+            Some("deflate=not-listed, br=not-listed, zstd=not-listed")
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_disabled_by_default_leaves_response_untouched() {
+        let svc = service_fn(handle);
+        let mut svc = Compression::new(svc).compress_when(Always);
+
+        let req = Request::builder()
+            .header("accept-encoding", "gzip;q=0")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        // The original rejection path is unchanged: identity passthrough, no diagnostics.
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert!(!res.headers().contains_key(CONTENT_ENCODING));
+        assert!(!res.headers().contains_key("x-accept-encoding-rejections"));
+
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"Hello, World!");
+    }
+
+    /// End-to-end demonstration of the diagnostics view over a small temp-dir fixture,
+    /// going through the `CompressionLayer` interface. Run with `--nocapture` to see the
+    /// negotiated encoding and rejection reasons for each request.
+    #[tokio::test]
+    async fn diagnostics_demo_with_temp_file_fixture() {
+        use tower::Layer;
+
+        // Small temp-dir fixture: a single tiny file served through the layer. It is larger
+        // than the default predicate's size floor so acceptable encodings get compressed.
+        let fixture: Vec<u8> = b"Hello, World! "
+            .iter()
+            .copied()
+            .cycle()
+            .take(280)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("tower-http-diag-demo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, &fixture).unwrap();
+
+        let svc = service_fn(move |_| {
+            let file = file.clone();
+            async move {
+                let bytes = std::fs::read(&file).unwrap();
+                Ok::<_, std::io::Error>(Response::new(Body::from(bytes)))
+            }
+        });
+        let mut svc = CompressionLayer::new().diagnostics(true).layer(svc);
+
+        for accept_encoding in [
+            "gzip;q=0",
+            "*;q=0",
+            "gzip;q=0,gzip;q=0",
+            "gzip;q=0,gzip;q=0.5",
+        ] {
+            let req = Request::builder()
+                .header("accept-encoding", accept_encoding)
+                .body(Body::empty())
+                .unwrap();
+            let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+            let selected = res
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("identity")
+                .to_owned();
+            let rejections = res
+                .headers()
+                .get("x-accept-encoding-rejections")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_owned();
+            println!(
+                "accept-encoding={accept_encoding:?} -> status={}, content-encoding={selected}, \
+                 x-accept-encoding-rejections={rejections}",
+                res.status()
+            );
+
+            // The body always round-trips to the fixture contents, compressed or not.
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            let decoded: Vec<u8> = match selected.as_str() {
+                "gzip" => {
+                    let mut buf = Vec::new();
+                    flate2::read::GzDecoder::new(&body[..])
+                        .read_to_end(&mut buf)
+                        .unwrap();
+                    buf
+                }
+                _ => body.to_vec(),
+            };
+            assert_eq!(decoded, fixture);
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

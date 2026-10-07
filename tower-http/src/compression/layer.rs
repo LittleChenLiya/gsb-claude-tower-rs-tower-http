@@ -15,6 +15,7 @@ pub struct CompressionLayer<P = DefaultPredicate> {
     accept: AcceptEncoding,
     predicate: P,
     quality: CompressionLevel,
+    diagnostics: bool,
 }
 
 impl<S, P> Layer<S> for CompressionLayer<P>
@@ -29,6 +30,7 @@ where
             accept: self.accept,
             predicate: self.predicate.clone(),
             quality: self.quality,
+            diagnostics: self.diagnostics,
         }
     }
 }
@@ -70,6 +72,14 @@ impl CompressionLayer {
     /// Sets the compression quality.
     pub fn quality(mut self, quality: CompressionLevel) -> Self {
         self.quality = quality;
+        self
+    }
+
+    /// Sets whether to include `Accept-Encoding` rejection diagnostics in responses.
+    ///
+    /// See [`Compression::diagnostics`] for more details.
+    pub fn diagnostics(mut self, enable: bool) -> Self {
+        self.diagnostics = enable;
         self
     }
 
@@ -116,6 +126,7 @@ impl CompressionLayer {
             accept: self.accept,
             predicate,
             quality: self.quality,
+            diagnostics: self.diagnostics,
         }
     }
 }

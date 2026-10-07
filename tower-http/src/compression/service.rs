@@ -19,6 +19,7 @@ pub struct Compression<S, P = DefaultPredicate> {
     pub(crate) accept: AcceptEncoding,
     pub(crate) predicate: P,
     pub(crate) quality: CompressionLevel,
+    pub(crate) diagnostics: bool,
 }
 
 impl<S> Compression<S, DefaultPredicate> {
@@ -29,6 +30,7 @@ impl<S> Compression<S, DefaultPredicate> {
             accept: AcceptEncoding::default(),
             predicate: DefaultPredicate::default(),
             quality: CompressionLevel::default(),
+            diagnostics: false,
         }
     }
 }
@@ -74,6 +76,26 @@ impl<S, P> Compression<S, P> {
     /// Sets the compression quality.
     pub fn quality(mut self, quality: CompressionLevel) -> Self {
         self.quality = quality;
+        self
+    }
+
+    /// Sets whether to include `Accept-Encoding` rejection diagnostics in responses.
+    ///
+    /// When enabled, each supported encoding that the request's `Accept-Encoding` header
+    /// forbids is reported in an `x-accept-encoding-rejections` response header as
+    /// `encoding=reason` pairs, where the reason is one of:
+    ///
+    /// - `explicit-q-zero` — the encoding was listed with `q=0`
+    /// - `wildcard-q-zero` — the encoding was not listed and a `*;q=0` wildcard forbids it
+    /// - `not-listed` — the encoding was not listed and no wildcard applies
+    ///
+    /// The header is omitted when nothing was rejected. The diagnostics are derived from the
+    /// same parse of the request headers that selects the response encoding, so enabling them
+    /// never changes which encoding is chosen.
+    ///
+    /// Disabled by default.
+    pub fn diagnostics(mut self, enable: bool) -> Self {
+        self.diagnostics = enable;
         self
     }
 
@@ -153,6 +175,7 @@ impl<S, P> Compression<S, P> {
             accept: self.accept,
             predicate,
             quality: self.quality,
+            diagnostics: self.diagnostics,
         }
     }
 }
@@ -173,13 +196,24 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let encoding = Encoding::from_headers(req.headers(), self.accept);
+        // The rejection diagnostics and the encoding selection share a single parse of the
+        // request headers; the headers are never parsed twice.
+        let (encoding, rejections) = if self.diagnostics {
+            let negotiation = Encoding::negotiate(req.headers(), self.accept);
+            (negotiation.encoding, negotiation.rejections)
+        } else {
+            (
+                Encoding::from_headers(req.headers(), self.accept),
+                Vec::new(),
+            )
+        };
 
         ResponseFuture {
             inner: self.inner.call(req),
             encoding,
             predicate: self.predicate.clone(),
             quality: self.quality,
+            rejections,
         }
     }
 }
