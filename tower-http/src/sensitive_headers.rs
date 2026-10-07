@@ -445,4 +445,120 @@ mod tests {
             assert!(value.is_sensitive())
         }
     }
+
+    #[tokio::test]
+    async fn response_layer_marks_repeated_values_but_keeps_bytes_and_order() {
+        async fn response_two_set_cookies(
+            req: http::Request<()>,
+        ) -> Result<http::Response<()>, ()> {
+            // The response layer must not touch the request, even for header
+            // names it was configured with.
+            let cookies: Vec<_> = req.headers().get_all(header::COOKIE).iter().collect();
+            assert_eq!(cookies.len(), 2);
+            assert!(cookies.iter().all(|value| !value.is_sensitive()));
+            assert_eq!(cookies[0].as_bytes(), b"cookie+1");
+            assert_eq!(cookies[1].as_bytes(), b"cookie+2");
+
+            let mut resp = http::Response::new(());
+            resp.headers_mut().append(
+                header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/html"),
+            );
+            resp.headers_mut().append(
+                header::SET_COOKIE,
+                http::HeaderValue::from_static("cookie-1"),
+            );
+            resp.headers_mut().append(
+                header::SET_COOKIE,
+                http::HeaderValue::from_static("cookie-2"),
+            );
+            Ok(resp)
+        }
+
+        let mut service = ServiceBuilder::new()
+            .layer(SetSensitiveResponseHeadersLayer::new(vec![
+                header::SET_COOKIE,
+                header::COOKIE,
+            ]))
+            .service_fn(response_two_set_cookies);
+
+        let mut req = http::Request::new(());
+        req.headers_mut()
+            .append(header::COOKIE, http::HeaderValue::from_static("cookie+1"));
+        req.headers_mut()
+            .append(header::COOKIE, http::HeaderValue::from_static("cookie+2"));
+
+        let resp = service.ready().await.unwrap().call(req).await.unwrap();
+
+        // A normal header that wasn't listed is left alone.
+        let content_type = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert!(!content_type.is_sensitive());
+        assert_eq!(content_type.as_bytes(), b"text/html");
+
+        // Every repeated value of a listed header is marked, while the raw
+        // bytes and their order are preserved.
+        let set_cookies: Vec<_> = resp.headers().get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(set_cookies.len(), 2);
+        assert_eq!(set_cookies[0].as_bytes(), b"cookie-1");
+        assert_eq!(set_cookies[1].as_bytes(), b"cookie-2");
+        assert!(set_cookies.iter().all(|value| value.is_sensitive()));
+    }
+
+    #[tokio::test]
+    async fn response_layer_preserves_inner_service_error() {
+        async fn failing_service(_req: http::Request<()>) -> Result<http::Response<()>, String> {
+            Err("something went wrong".to_owned())
+        }
+
+        let mut service = ServiceBuilder::new()
+            .layer(SetSensitiveResponseHeadersLayer::new(vec![
+                header::SET_COOKIE,
+            ]))
+            .service_fn(failing_service);
+
+        let err = service
+            .ready()
+            .await
+            .unwrap()
+            .call(http::Request::new(()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, "something went wrong");
+    }
+
+    #[tokio::test]
+    async fn without_the_layer_response_headers_are_unchanged() {
+        async fn response_two_set_cookies(
+            _req: http::Request<()>,
+        ) -> Result<http::Response<()>, ()> {
+            let mut resp = http::Response::new(());
+            resp.headers_mut().append(
+                header::SET_COOKIE,
+                http::HeaderValue::from_static("cookie-1"),
+            );
+            resp.headers_mut().append(
+                header::SET_COOKIE,
+                http::HeaderValue::from_static("cookie-2"),
+            );
+            Ok(resp)
+        }
+
+        // No `SetSensitiveResponseHeadersLayer` is applied.
+        let mut service = ServiceBuilder::new().service_fn(response_two_set_cookies);
+
+        let resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(http::Request::new(()))
+            .await
+            .unwrap();
+
+        let set_cookies: Vec<_> = resp.headers().get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(set_cookies.len(), 2);
+        assert_eq!(set_cookies[0].as_bytes(), b"cookie-1");
+        assert_eq!(set_cookies[1].as_bytes(), b"cookie-2");
+        assert!(set_cookies.iter().all(|value| !value.is_sensitive()));
+    }
 }
