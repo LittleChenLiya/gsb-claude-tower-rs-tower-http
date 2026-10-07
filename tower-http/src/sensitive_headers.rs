@@ -445,4 +445,125 @@ mod tests {
             assert!(value.is_sensitive())
         }
     }
+
+    // Fake service that returns two `set-cookie` values plus a plain header.
+    // The response layer must mark every repeated value sensitive while keeping
+    // the bytes and the order untouched, and must leave request headers alone.
+    #[tokio::test]
+    async fn response_layer_marks_repeated_headers_without_changing_values() {
+        async fn fake(
+            req: http::Request<()>,
+        ) -> Result<http::Response<()>, std::convert::Infallible> {
+            // The response-only layer must never touch request headers.
+            for value in req.headers().get_all(header::COOKIE).iter() {
+                assert!(!value.is_sensitive());
+            }
+
+            let mut resp = http::Response::new(());
+            resp.headers_mut().append(
+                header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain"),
+            );
+            resp.headers_mut()
+                .append(header::SET_COOKIE, http::HeaderValue::from_static("a=1"));
+            resp.headers_mut()
+                .append(header::SET_COOKIE, http::HeaderValue::from_static("b=2"));
+            Ok(resp)
+        }
+
+        let mut service = ServiceBuilder::new()
+            .layer(SetSensitiveResponseHeadersLayer::new(vec![
+                header::SET_COOKIE,
+            ]))
+            .service_fn(fake);
+
+        let mut req = http::Request::new(());
+        req.headers_mut()
+            .append(header::COOKIE, http::HeaderValue::from_static("req=1"));
+
+        let resp = service.ready().await.unwrap().call(req).await.unwrap();
+        let headers = resp.headers();
+
+        // The plain, unlisted header is not marked and keeps its bytes.
+        let content_type = headers.get(header::CONTENT_TYPE).unwrap();
+        assert!(!content_type.is_sensitive());
+        assert_eq!(content_type, "text/plain");
+
+        // Both repeated values are marked sensitive...
+        let cookies: Vec<_> = headers.get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies.iter().all(|value| value.is_sensitive()));
+
+        // ...their bytes are unchanged...
+        assert_eq!(cookies[0], "a=1");
+        assert_eq!(cookies[1], "b=2");
+
+        // ...and their relative order is preserved.
+        let ordered: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| *name == header::SET_COOKIE)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(ordered, cookies);
+    }
+
+    // When the inner service fails, its error must pass through untouched and
+    // no response headers are marked.
+    #[tokio::test]
+    async fn response_layer_preserves_inner_error() {
+        #[derive(Debug, PartialEq)]
+        struct Boom;
+
+        async fn fail(_req: http::Request<()>) -> Result<http::Response<()>, Boom> {
+            Err(Boom)
+        }
+
+        let mut service = ServiceBuilder::new()
+            .layer(SetSensitiveResponseHeadersLayer::new(vec![
+                header::SET_COOKIE,
+            ]))
+            .service_fn(fail);
+
+        let err = service
+            .ready()
+            .await
+            .unwrap()
+            .call(http::Request::new(()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, Boom);
+    }
+
+    // Without wrapping a service in a layer nothing is marked: the raw inner
+    // service keeps all headers non-sensitive.
+    #[tokio::test]
+    async fn no_layer_means_no_changes() {
+        async fn raw(
+            _req: http::Request<()>,
+        ) -> Result<http::Response<()>, std::convert::Infallible> {
+            let mut resp = http::Response::new(());
+            resp.headers_mut()
+                .append(header::SET_COOKIE, http::HeaderValue::from_static("a=1"));
+            resp.headers_mut()
+                .append(header::SET_COOKIE, http::HeaderValue::from_static("b=2"));
+            Ok(resp)
+        }
+
+        let mut service = tower::service_fn(raw);
+
+        let resp = service
+            .ready()
+            .await
+            .unwrap()
+            .call(http::Request::new(()))
+            .await
+            .unwrap();
+
+        let values: Vec<_> = resp.headers().get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().all(|value| !value.is_sensitive()));
+        assert_eq!(values[0], "a=1");
+        assert_eq!(values[1], "b=2");
+    }
 }
